@@ -5,6 +5,14 @@ edition = "2021"
 description = "Analyze IP addresses from log files with reverse DNS and whois lookups"
 license = "MIT"
 
+[[bin]]
+name = "ip-report"
+path = "src/main.rs"
+
+[lib]
+name = "ip_report"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 regex = "1"
@@ -16,3 +24,12 @@ crossterm = "0.28"
 chrono = "0.4"
 anyhow = "1"
 atty = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+ipnetwork = "0.20"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1.5"
+tempfile = "3.10"
