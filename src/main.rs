@@ -5,6 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ipnetwork::IpNetwork;
 use ratatui::{
     backend::CrosstermBackend,
     layout::Constraint,
@@ -14,18 +15,17 @@ use ratatui::{
 };
 use regex::Regex;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Write, stdout, stderr},
+    io::{stderr, stdout, BufRead, BufReader, Write},
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::Semaphore;
-use serde::{Deserialize, Serialize};
-use ipnetwork::IpNetwork;
 
 #[derive(Clone, Copy, PartialEq)]
 enum GroupBy {
@@ -42,7 +42,7 @@ impl GroupBy {
             GroupBy::UserAgent => GroupBy::Ip,
         }
     }
-    
+
     fn label(self) -> &'static str {
         match self {
             GroupBy::Ip => "IP",
@@ -66,7 +66,11 @@ fn extract_ua_base(ua: &str) -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "ip-report", version, about = "Analyze IP addresses from log files")]
+#[command(
+    name = "ip-report",
+    version,
+    about = "Analyze IP addresses from log files"
+)]
 struct Args {
     /// Input file to parse
     file: PathBuf,
@@ -318,11 +322,11 @@ struct GcpPrefix {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    
+
     if args.top.is_some() && args.min.is_some() {
         anyhow::bail!("Cannot use both --top and --min together");
     }
-    
+
     let (ip_counts, total_lines, global_ua_counts) = parse_file(
         &args.file,
         args.filter.as_deref(),
@@ -340,18 +344,22 @@ fn main() -> Result<()> {
     } else {
         format!("{}", total_ips)
     };
-    
+
     if filtered.is_empty() {
         eprintln!("No IPs match the criteria");
         return Ok(());
     }
-    
+
     if args.no_lookup {
         println!("Total lines: {}\n", total_lines);
         println!("{:<8} {:<6} {:<45} {}", "Count", "%", "IP", "User Agent");
         println!("{}", "-".repeat(110));
         for (ip, count, _is_v6, ua) in &filtered {
-            let pct = if total_lines > 0 { (*count as f64 / total_lines as f64) * 100.0 } else { 0.0 };
+            let pct = if total_lines > 0 {
+                (*count as f64 / total_lines as f64) * 100.0
+            } else {
+                0.0
+            };
             println!(
                 "{:<8} {:<6.2} {:<45} {}",
                 count,
@@ -394,8 +402,16 @@ fn main() -> Result<()> {
         }
     };
 
-    rt.block_on(run_lookups_and_display(filtered, &args.db, args.concurrency, total_lines, &filter_desc, cloud_cache, global_ua_counts))?;
-    
+    rt.block_on(run_lookups_and_display(
+        filtered,
+        &args.db,
+        args.concurrency,
+        total_lines,
+        &filter_desc,
+        cloud_cache,
+        global_ua_counts,
+    ))?;
+
     Ok(())
 }
 
@@ -406,16 +422,24 @@ fn parse_file(
     delimiter: Option<&str>,
     ip_field: Option<usize>,
     ua_field: Option<usize>,
-) -> Result<(HashMap<String, (u64, bool, Option<String>)>, u64, HashMap<String, u64>)> {
+) -> Result<(
+    HashMap<String, (u64, bool, Option<String>)>,
+    u64,
+    HashMap<String, u64>,
+)> {
     let file = File::open(path).context("Failed to open input file")?;
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    
-    let filter_re = filter.map(|p| Regex::new(p)).transpose()
+
+    let filter_re = filter
+        .map(|p| Regex::new(p))
+        .transpose()
         .context("Invalid --filter regex")?;
-    let ua_filter_re = ua_filter.map(|p| Regex::new(p)).transpose()
+    let ua_filter_re = ua_filter
+        .map(|p| Regex::new(p))
+        .transpose()
         .context("Invalid --ua-filter regex")?;
-    
+
     // Only compile regex if not using delimiter mode
     let ipv4_re = if delimiter.is_none() {
         Some(Regex::new(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")?)
@@ -423,11 +447,13 @@ fn parse_file(
         None
     };
     let ipv6_re = if delimiter.is_none() {
-        Some(Regex::new(r"\b((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?::[0-9a-fA-F]{1,4}){1,7}|::)\b")?)
+        Some(Regex::new(
+            r"\b((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?::[0-9a-fA-F]{1,4}){1,7}|::)\b",
+        )?)
     } else {
         None
     };
-    
+
     // Track (count, is_v6, ua_counts)
     let mut counts: HashMap<String, (u64, bool, HashMap<String, u64>)> = HashMap::new();
     // Track global user agent counts (base name without version)
@@ -436,7 +462,7 @@ fn parse_file(
     let mut bytes_read: u64 = 0;
     let mut last_progress: u64 = 0;
     let mut line = String::new();
-    
+
     loop {
         line.clear();
         let n = reader.read_line(&mut line)?;
@@ -444,57 +470,73 @@ fn parse_file(
             break;
         }
         bytes_read += n as u64;
-        
+
         if bytes_read - last_progress > 10_000_000 {
             last_progress = bytes_read;
             if file_size > 0 {
-                eprint!("\rReading: {}% ({} lines)", bytes_read * 100 / file_size, total_lines);
+                eprint!(
+                    "\rReading: {}% ({} lines)",
+                    bytes_read * 100 / file_size,
+                    total_lines
+                );
             } else {
                 eprint!("\rReading: {} bytes ({} lines)", bytes_read, total_lines);
             }
             stderr().flush().ok();
         }
-        
+
         let line = line.trim_end();
-        
+
         if let Some(ref re) = filter_re {
             if !re.is_match(line) {
                 continue;
             }
         }
-        
+
         let (ip_str, user_agent) = if let Some(delim) = delimiter {
             let fields: Vec<&str> = line.split(delim).collect();
-            
+
             let ip = if let Some(idx) = ip_field {
                 fields.get(idx.saturating_sub(1)).map(|s| *s)
             } else {
-                fields.iter().find(|f| f.parse::<IpAddr>().is_ok()).map(|s| *s)
+                fields
+                    .iter()
+                    .find(|f| f.parse::<IpAddr>().is_ok())
+                    .map(|s| *s)
             };
-            
+
             let ua = if let Some(idx) = ua_field {
-                fields.get(idx.saturating_sub(1)).filter(|s| !s.is_empty()).map(|s| s.to_string())
+                fields
+                    .get(idx.saturating_sub(1))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
             } else {
-                fields.iter().rev().find(|f| !f.is_empty()).map(|s| s.to_string())
+                fields
+                    .iter()
+                    .rev()
+                    .find(|f| !f.is_empty())
+                    .map(|s| s.to_string())
             };
-            
+
             (ip.map(|s| s.to_string()), ua)
         } else {
             let ua = if let Some(last_quote) = line.rfind('"') {
-                line[..last_quote].rfind('"').map(|start| line[start + 1..last_quote].to_string())
+                line[..last_quote]
+                    .rfind('"')
+                    .map(|start| line[start + 1..last_quote].to_string())
             } else {
                 None
             };
             (None, ua)
         };
-        
+
         if let Some(ref re) = ua_filter_re {
             match &user_agent {
                 Some(ua) if re.is_match(ua) => {}
                 _ => continue,
             }
         }
-        
+
         total_lines += 1;
 
         let mut record_hit = |ip: IpAddr, ua: Option<String>| {
@@ -509,18 +551,18 @@ fn parse_file(
                 *global_ua_counts.entry(ua_base).or_insert(0) += 1;
             }
         };
-        
+
         if let Some(ref ip_s) = ip_str {
             if let Ok(ip) = ip_s.parse::<IpAddr>() {
                 record_hit(ip, user_agent);
                 continue;
             }
         }
-        
+
         if delimiter.is_some() {
             continue;
         }
-        
+
         // Fast path: first word is IP
         if let Some(first_word) = line.split_whitespace().next() {
             if let Ok(ip) = first_word.parse::<IpAddr>() {
@@ -528,7 +570,7 @@ fn parse_file(
                 continue;
             }
         }
-        
+
         if let Some(ref re) = ipv4_re {
             if let Some(cap) = re.captures(line) {
                 if let Some(m) = cap.get(1) {
@@ -539,7 +581,7 @@ fn parse_file(
                 }
             }
         }
-        
+
         if let Some(ref re) = ipv6_re {
             if let Some(cap) = re.captures(line) {
                 if let Some(m) = cap.get(1) {
@@ -550,11 +592,11 @@ fn parse_file(
             }
         }
     }
-    
+
     if last_progress > 0 {
         eprintln!("\rReading: done ({} lines)        ", total_lines);
     }
-    
+
     // Convert to final format with most common UA
     let result: HashMap<String, (u64, bool, Option<String>)> = counts
         .into_iter()
@@ -575,11 +617,12 @@ fn apply_filters(
     top: Option<&str>,
     min: Option<u64>,
 ) -> Vec<(String, u64, bool, Option<String>)> {
-    let mut sorted: Vec<_> = counts.into_iter()
+    let mut sorted: Vec<_> = counts
+        .into_iter()
         .map(|(ip, (c, v6, ua))| (ip, c, v6, ua))
         .collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    
+
     if let Some(top_str) = top {
         let limit = if top_str.ends_with('%') {
             let pct: f64 = top_str.trim_end_matches('%').parse().unwrap_or(100.0);
@@ -589,11 +632,11 @@ fn apply_filters(
         };
         sorted.truncate(limit);
     }
-    
+
     if let Some(min_count) = min {
         sorted.retain(|(_, c, _, _)| *c >= min_count);
     }
-    
+
     sorted
 }
 
@@ -608,37 +651,40 @@ async fn run_lookups_and_display(
 ) -> Result<()> {
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
-    
-    let records: Vec<IpRecord> = ips.iter().map(|(ip, count, is_v6, ua)| {
-        let existing = get_ip_record(&conn, ip);
-        if let Some(rec) = existing {
-            IpRecord {
-                ip: ip.clone(),
-                count: *count,
-                user_agent: ua.clone().or(rec.2),
-                reverse_dns: rec.3,
-                org: rec.4,
-                looked_up: rec.5,
-                lookup_in_progress: false,
+
+    let records: Vec<IpRecord> = ips
+        .iter()
+        .map(|(ip, count, is_v6, ua)| {
+            let existing = get_ip_record(&conn, ip);
+            if let Some(rec) = existing {
+                IpRecord {
+                    ip: ip.clone(),
+                    count: *count,
+                    user_agent: ua.clone().or(rec.2),
+                    reverse_dns: rec.3,
+                    org: rec.4,
+                    looked_up: rec.5,
+                    lookup_in_progress: false,
+                }
+            } else {
+                insert_ip(&conn, ip, *is_v6, ua.as_deref()).ok();
+                IpRecord {
+                    ip: ip.clone(),
+                    count: *count,
+                    user_agent: ua.clone(),
+                    reverse_dns: None,
+                    org: None,
+                    looked_up: false,
+                    lookup_in_progress: false,
+                }
             }
-        } else {
-            insert_ip(&conn, ip, *is_v6, ua.as_deref()).ok();
-            IpRecord {
-                ip: ip.clone(),
-                count: *count,
-                user_agent: ua.clone(),
-                reverse_dns: None,
-                org: None,
-                looked_up: false,
-                lookup_in_progress: false,
-            }
-        }
-    }).collect();
-    
+        })
+        .collect();
+
     let records = Arc::new(Mutex::new(records));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let db_path = db_path.clone();
-    
+
     let indices_to_lookup: Vec<(usize, String)> = {
         let recs = records.lock().unwrap();
         recs.iter()
@@ -647,7 +693,7 @@ async fn run_lookups_and_display(
             .map(|(idx, rec)| (idx, rec.ip.clone()))
             .collect()
     };
-    
+
     let mut handles = vec![];
     for (idx, ip) in indices_to_lookup {
         let sem = semaphore.clone();
@@ -658,38 +704,53 @@ async fn run_lookups_and_display(
         recs.lock().unwrap()[idx].lookup_in_progress = true;
 
         let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let (rdns, org) = perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref())).await;
+            let _permit = sem.acquire().await.unwrap();
+            let (rdns, org) =
+                perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref())).await;
 
-                {
-                    let mut recs = recs.lock().unwrap();
-                    recs[idx].reverse_dns = rdns.clone();
-                    recs[idx].org = org.clone();
-                    recs[idx].looked_up = true;
-                    recs[idx].lookup_in_progress = false;
-                }
+            {
+                let mut recs = recs.lock().unwrap();
+                recs[idx].reverse_dns = rdns.clone();
+                recs[idx].org = org.clone();
+                recs[idx].looked_up = true;
+                recs[idx].lookup_in_progress = false;
+            }
 
-                if let Ok(conn) = Connection::open(&dbp) {
-                    update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref()).ok();
-                }
-            });
-            handles.push(handle);
-        }
-    
+            if let Ok(conn) = Connection::open(&dbp) {
+                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref()).ok();
+            }
+        });
+        handles.push(handle);
+    }
+
     let is_tty = atty::is(atty::Stream::Stdout);
-    
+
     if is_tty {
-        run_tui(records.clone(), handles, total_lines, filter_desc, global_ua_counts).await?;
+        run_tui(
+            records.clone(),
+            handles,
+            total_lines,
+            filter_desc,
+            global_ua_counts,
+        )
+        .await?;
     } else {
         for h in handles {
             h.await.ok();
         }
         let recs = records.lock().unwrap();
         println!("Total lines: {}\n", total_lines);
-        println!("{:<8} {:<6} {:<40} {:<40} {:<30} {}", "Count", "%", "IP", "Reverse DNS", "Org", "User Agent");
+        println!(
+            "{:<8} {:<6} {:<40} {:<40} {:<30} {}",
+            "Count", "%", "IP", "Reverse DNS", "Org", "User Agent"
+        );
         println!("{}", "-".repeat(170));
         for rec in recs.iter() {
-            let pct = if total_lines > 0 { (rec.count as f64 / total_lines as f64) * 100.0 } else { 0.0 };
+            let pct = if total_lines > 0 {
+                (rec.count as f64 / total_lines as f64) * 100.0
+            } else {
+                0.0
+            };
             println!(
                 "{:<8} {:<6.2} {:<40} {:<40} {:<30} {}",
                 rec.count,
@@ -701,7 +762,7 @@ async fn run_lookups_and_display(
             );
         }
     }
-    
+
     Ok(())
 }
 
@@ -717,7 +778,7 @@ async fn run_tui(
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    
+
     let mut table_state = TableState::default();
     table_state.select(Some(0));
     let mut group_by = GroupBy::Ip;
@@ -726,7 +787,7 @@ async fn run_tui(
     let mut show_org = true;
     let mut search_mode = false;
     let mut search_query = String::new();
-    
+
     let pending_count = Arc::new(Mutex::new(handles.len()));
     for h in handles {
         let pc = pending_count.clone();
@@ -735,24 +796,36 @@ async fn run_tui(
             *pc.lock().unwrap() -= 1;
         });
     }
-    
+
     loop {
         let recs = records.lock().unwrap().clone();
         let pending = *pending_count.lock().unwrap();
-        
+
         terminal.draw(|f| {
             let filtered_recs: Vec<IpRecord> = if search_query.is_empty() {
                 recs.clone()
             } else {
                 let q = search_query.to_lowercase();
-                recs.iter().filter(|r| {
-                    r.ip.to_lowercase().contains(&q)
-                        || r.reverse_dns.as_ref().map(|s| s.to_lowercase().contains(&q)).unwrap_or(false)
-                        || r.org.as_ref().map(|s| s.to_lowercase().contains(&q)).unwrap_or(false)
-                        || r.user_agent.as_ref().map(|s| s.to_lowercase().contains(&q)).unwrap_or(false)
-                }).cloned().collect()
+                recs.iter()
+                    .filter(|r| {
+                        r.ip.to_lowercase().contains(&q)
+                            || r.reverse_dns
+                                .as_ref()
+                                .map(|s| s.to_lowercase().contains(&q))
+                                .unwrap_or(false)
+                            || r.org
+                                .as_ref()
+                                .map(|s| s.to_lowercase().contains(&q))
+                                .unwrap_or(false)
+                            || r.user_agent
+                                .as_ref()
+                                .map(|s| s.to_lowercase().contains(&q))
+                                .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
             };
-            
+
             let search_str = if search_mode {
                 format!(" [SEARCH: {}█]", search_query)
             } else if !search_query.is_empty() {
@@ -760,14 +833,46 @@ async fn run_tui(
             } else {
                 String::new()
             };
-            
+
             match group_by {
-                GroupBy::Ip => render_ip_view(f, &filtered_recs, &mut table_state, total_lines, pending, show_rdns, show_ua, show_org, filter_desc, group_by, &search_str),
-                GroupBy::Org => render_grouped_view(f, &filtered_recs, &mut table_state, total_lines, pending, filter_desc, "Org", group_by, &search_str, |r| r.org.clone().unwrap_or_else(|| "-".to_string())),
-                GroupBy::UserAgent => render_ua_global_view(f, &global_ua_counts, &mut table_state, total_lines, pending, filter_desc, group_by, &search_str),
+                GroupBy::Ip => render_ip_view(
+                    f,
+                    &filtered_recs,
+                    &mut table_state,
+                    total_lines,
+                    pending,
+                    show_rdns,
+                    show_ua,
+                    show_org,
+                    filter_desc,
+                    group_by,
+                    &search_str,
+                ),
+                GroupBy::Org => render_grouped_view(
+                    f,
+                    &filtered_recs,
+                    &mut table_state,
+                    total_lines,
+                    pending,
+                    filter_desc,
+                    "Org",
+                    group_by,
+                    &search_str,
+                    |r| r.org.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                GroupBy::UserAgent => render_ua_global_view(
+                    f,
+                    &global_ua_counts,
+                    &mut table_state,
+                    total_lines,
+                    pending,
+                    filter_desc,
+                    group_by,
+                    &search_str,
+                ),
             }
         })?;
-        
+
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -794,25 +899,43 @@ async fn run_tui(
                         }
                         continue;
                     }
-                    
+
                     let filtered_recs: Vec<&IpRecord> = if search_query.is_empty() {
                         recs.iter().collect()
                     } else {
                         let q = search_query.to_lowercase();
-                        recs.iter().filter(|r| {
-                            r.ip.to_lowercase().contains(&q)
-                                || r.reverse_dns.as_ref().map(|s| s.to_lowercase().contains(&q)).unwrap_or(false)
-                                || r.org.as_ref().map(|s| s.to_lowercase().contains(&q)).unwrap_or(false)
-                                || r.user_agent.as_ref().map(|s| s.to_lowercase().contains(&q)).unwrap_or(false)
-                        }).collect()
+                        recs.iter()
+                            .filter(|r| {
+                                r.ip.to_lowercase().contains(&q)
+                                    || r.reverse_dns
+                                        .as_ref()
+                                        .map(|s| s.to_lowercase().contains(&q))
+                                        .unwrap_or(false)
+                                    || r.org
+                                        .as_ref()
+                                        .map(|s| s.to_lowercase().contains(&q))
+                                        .unwrap_or(false)
+                                    || r.user_agent
+                                        .as_ref()
+                                        .map(|s| s.to_lowercase().contains(&q))
+                                        .unwrap_or(false)
+                            })
+                            .collect()
                     };
-                    
+
                     let len = match group_by {
                         GroupBy::Ip => filtered_recs.len(),
-                        GroupBy::Org => aggregate_by_field(&filtered_recs.iter().map(|r| (*r).clone()).collect::<Vec<_>>(), |r| r.org.clone().unwrap_or_else(|| "-".to_string())).len(),
+                        GroupBy::Org => aggregate_by_field(
+                            &filtered_recs
+                                .iter()
+                                .map(|r| (*r).clone())
+                                .collect::<Vec<_>>(),
+                            |r| r.org.clone().unwrap_or_else(|| "-".to_string()),
+                        )
+                        .len(),
                         GroupBy::UserAgent => global_ua_counts.len(),
                     };
-                    
+
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('s') | KeyCode::Char('/') => {
@@ -849,11 +972,15 @@ async fn run_tui(
             }
         }
     }
-    
+
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
-    
+
     Ok(())
 }
 
@@ -868,7 +995,10 @@ where
         entry.0 += rec.count;
         entry.1 += 1;
     }
-    let mut sorted: Vec<_> = groups.into_iter().map(|(k, (count, n))| (k, count, n)).collect();
+    let mut sorted: Vec<_> = groups
+        .into_iter()
+        .map(|(k, (count, n))| (k, count, n))
+        .collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     sorted
 }
@@ -886,65 +1016,105 @@ fn render_ip_view(
     group_by: GroupBy,
     search_str: &str,
 ) {
-    let mut header_cells = vec![
-        Cell::from("Count"),
-        Cell::from("%"),
-        Cell::from("IP"),
-    ];
-    if show_rdns { header_cells.push(Cell::from("Reverse DNS")); }
-    if show_org { header_cells.push(Cell::from("Org")); }
-    if show_ua { header_cells.push(Cell::from("User Agent")); }
-    
+    let mut header_cells = vec![Cell::from("Count"), Cell::from("%"), Cell::from("IP")];
+    if show_rdns {
+        header_cells.push(Cell::from("Reverse DNS"));
+    }
+    if show_org {
+        header_cells.push(Cell::from("Org"));
+    }
+    if show_ua {
+        header_cells.push(Cell::from("User Agent"));
+    }
+
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
-    
+
     let visible_cols = 3 + show_rdns as usize + show_ua as usize + show_org as usize;
-    let extra_width: usize = if visible_cols <= 4 { 60 } else if visible_cols == 5 { 30 } else { 0 };
-    
-    let rows: Vec<Row> = recs.iter().map(|rec| {
-        let status = if rec.lookup_in_progress { "⏳" } else { "" };
-        let pct = if total_lines > 0 { (rec.count as f64 / total_lines as f64) * 100.0 } else { 0.0 };
-        let mut cells = vec![
-            Cell::from(format!("{}{}", rec.count, status)),
-            Cell::from(format!("{:.2}", pct)),
-            Cell::from(rec.ip.clone()),
-        ];
-        if show_rdns {
-            cells.push(Cell::from(truncate_str(rec.reverse_dns.as_deref().unwrap_or("-"), 38 + extra_width)));
-        }
-        if show_org {
-            cells.push(Cell::from(truncate_str(rec.org.as_deref().unwrap_or("-"), 25 + extra_width)));
-        }
-        if show_ua {
-            cells.push(Cell::from(truncate_str(rec.user_agent.as_deref().unwrap_or("-"), 40 + extra_width)));
-        }
-        Row::new(cells)
-    }).collect();
-    
+    let extra_width: usize = if visible_cols <= 4 {
+        60
+    } else if visible_cols == 5 {
+        30
+    } else {
+        0
+    };
+
+    let rows: Vec<Row> = recs
+        .iter()
+        .map(|rec| {
+            let status = if rec.lookup_in_progress { "⏳" } else { "" };
+            let pct = if total_lines > 0 {
+                (rec.count as f64 / total_lines as f64) * 100.0
+            } else {
+                0.0
+            };
+            let mut cells = vec![
+                Cell::from(format!("{}{}", rec.count, status)),
+                Cell::from(format!("{:.2}", pct)),
+                Cell::from(rec.ip.clone()),
+            ];
+            if show_rdns {
+                cells.push(Cell::from(truncate_str(
+                    rec.reverse_dns.as_deref().unwrap_or("-"),
+                    38 + extra_width,
+                )));
+            }
+            if show_org {
+                cells.push(Cell::from(truncate_str(
+                    rec.org.as_deref().unwrap_or("-"),
+                    25 + extra_width,
+                )));
+            }
+            if show_ua {
+                cells.push(Cell::from(truncate_str(
+                    rec.user_agent.as_deref().unwrap_or("-"),
+                    40 + extra_width,
+                )));
+            }
+            Row::new(cells)
+        })
+        .collect();
+
     let mut widths = vec![
         Constraint::Length(10),
         Constraint::Length(6),
         Constraint::Length(40),
     ];
-    if show_rdns { widths.push(Constraint::Length((40 + extra_width) as u16)); }
-    if show_org { widths.push(Constraint::Length((27 + extra_width) as u16)); }
-    if show_ua { widths.push(Constraint::Min(20)); }
-    
-    let toggles = format!("r:{} u:{} o:{}",
+    if show_rdns {
+        widths.push(Constraint::Length((40 + extra_width) as u16));
+    }
+    if show_org {
+        widths.push(Constraint::Length((27 + extra_width) as u16));
+    }
+    if show_ua {
+        widths.push(Constraint::Min(20));
+    }
+
+    let toggles = format!(
+        "r:{} u:{} o:{}",
         if show_rdns { "on" } else { "off" },
         if show_ua { "on" } else { "off" },
         if show_org { "on" } else { "off" },
     );
-    
-    let pending_str = if pending > 0 { format!(", {} pending", pending) } else { String::new() };
-    
+
+    let pending_str = if pending > 0 {
+        format!(", {} pending", pending)
+    } else {
+        String::new()
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
             " {} IPs, {} lines{} [{}] [by:{}]{} (g/r/u/o/s, q=quit) ",
-            filter_desc, total_lines, pending_str, toggles, group_by.label(), search_str
+            filter_desc,
+            total_lines,
+            pending_str,
+            toggles,
+            group_by.label(),
+            search_str
         )))
         .row_highlight_style(Style::default().bg(Color::DarkGray));
-    
+
     f.render_stateful_widget(table, f.area(), table_state);
 }
 
@@ -959,46 +1129,62 @@ fn render_grouped_view<F>(
     group_by: GroupBy,
     search_str: &str,
     key_fn: F,
-)
-where
+) where
     F: Fn(&IpRecord) -> String,
 {
     let groups = aggregate_by_field(recs, key_fn);
-    
+
     let header = Row::new(vec![
         Cell::from("Count"),
         Cell::from("%"),
         Cell::from("IPs"),
         Cell::from(group_label),
-    ]).style(Style::default().add_modifier(Modifier::BOLD));
-    
-    let rows: Vec<Row> = groups.iter().map(|(key, count, ip_count)| {
-        let pct = if total_lines > 0 { (*count as f64 / total_lines as f64) * 100.0 } else { 0.0 };
-        Row::new(vec![
-            Cell::from(format!("{}", count)),
-            Cell::from(format!("{:.2}", pct)),
-            Cell::from(format!("{}", ip_count)),
-            Cell::from(key.clone()),
-        ])
-    }).collect();
-    
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = groups
+        .iter()
+        .map(|(key, count, ip_count)| {
+            let pct = if total_lines > 0 {
+                (*count as f64 / total_lines as f64) * 100.0
+            } else {
+                0.0
+            };
+            Row::new(vec![
+                Cell::from(format!("{}", count)),
+                Cell::from(format!("{:.2}", pct)),
+                Cell::from(format!("{}", ip_count)),
+                Cell::from(key.clone()),
+            ])
+        })
+        .collect();
+
     let widths = [
         Constraint::Length(10),
         Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Min(40),
     ];
-    
-    let pending_str = if pending > 0 { format!(", {} pending", pending) } else { String::new() };
-    
+
+    let pending_str = if pending > 0 {
+        format!(", {} pending", pending)
+    } else {
+        String::new()
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
             " {} IPs by {}, {} lines{} [by:{}]{} (g/s, q=quit) ",
-            filter_desc, group_label, total_lines, pending_str, group_by.label(), search_str
+            filter_desc,
+            group_label,
+            total_lines,
+            pending_str,
+            group_by.label(),
+            search_str
         )))
         .row_highlight_style(Style::default().bg(Color::DarkGray));
-    
+
     f.render_stateful_widget(table, f.area(), table_state);
 }
 
@@ -1013,7 +1199,8 @@ fn render_ua_global_view(
     search_str: &str,
 ) {
     // Convert global UA counts to sorted vec
-    let mut ua_groups: Vec<(String, u64)> = global_ua_counts.iter()
+    let mut ua_groups: Vec<(String, u64)> = global_ua_counts
+        .iter()
         .map(|(ua, count)| (ua.clone(), *count))
         .collect();
     ua_groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1022,16 +1209,24 @@ fn render_ua_global_view(
         Cell::from("Count"),
         Cell::from("%"),
         Cell::from("User Agent"),
-    ]).style(Style::default().add_modifier(Modifier::BOLD));
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = ua_groups.iter().map(|(ua, count)| {
-        let pct = if total_lines > 0 { (*count as f64 / total_lines as f64) * 100.0 } else { 0.0 };
-        Row::new(vec![
-            Cell::from(format!("{}", count)),
-            Cell::from(format!("{:.2}", pct)),
-            Cell::from(ua.clone()),
-        ])
-    }).collect();
+    let rows: Vec<Row> = ua_groups
+        .iter()
+        .map(|(ua, count)| {
+            let pct = if total_lines > 0 {
+                (*count as f64 / total_lines as f64) * 100.0
+            } else {
+                0.0
+            };
+            Row::new(vec![
+                Cell::from(format!("{}", count)),
+                Cell::from(format!("{:.2}", pct)),
+                Cell::from(ua.clone()),
+            ])
+        })
+        .collect();
 
     let widths = [
         Constraint::Length(10),
@@ -1039,13 +1234,21 @@ fn render_ua_global_view(
         Constraint::Min(40),
     ];
 
-    let pending_str = if pending > 0 { format!(", {} pending", pending) } else { String::new() };
+    let pending_str = if pending > 0 {
+        format!(", {} pending", pending)
+    } else {
+        String::new()
+    };
 
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
             " {} IPs by User Agent, {} lines{} [by:{}]{} (g/s, q=quit) ",
-            filter_desc, total_lines, pending_str, group_by.label(), search_str
+            filter_desc,
+            total_lines,
+            pending_str,
+            group_by.label(),
+            search_str
         )))
         .row_highlight_style(Style::default().bg(Color::DarkGray));
 
@@ -1088,14 +1291,22 @@ async fn fetch_cloud_ranges(provider: CloudProvider) -> Result<Vec<CloudRange>> 
             Err(e) => {
                 attempts += 1;
                 if attempts >= max_attempts {
-                    return Err(anyhow::anyhow!("Failed to fetch {} ranges after {} attempts: {}", provider.as_str(), max_attempts, e));
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch {} ranges after {} attempts: {}",
+                        provider.as_str(),
+                        max_attempts,
+                        e
+                    ));
                 }
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempts))).await;
             }
         }
     }
 
-    Err(anyhow::anyhow!("Failed to fetch {} ranges", provider.as_str()))
+    Err(anyhow::anyhow!(
+        "Failed to fetch {} ranges",
+        provider.as_str()
+    ))
 }
 
 async fn fetch_cloudflare_ranges() -> Result<Vec<CloudRange>> {
@@ -1109,7 +1320,11 @@ async fn fetch_cloudflare_ranges() -> Result<Vec<CloudRange>> {
     if let Ok(response) = client.get("https://www.cloudflare.com/ips-v4").send().await {
         if response.status().is_success() {
             let body = response.text().await?;
-            ranges.extend(parse_cloudflare_text(&body, CloudProvider::Cloudflare, false)?);
+            ranges.extend(parse_cloudflare_text(
+                &body,
+                CloudProvider::Cloudflare,
+                false,
+            )?);
         }
     }
 
@@ -1117,7 +1332,11 @@ async fn fetch_cloudflare_ranges() -> Result<Vec<CloudRange>> {
     if let Ok(response) = client.get("https://www.cloudflare.com/ips-v6").send().await {
         if response.status().is_success() {
             let body = response.text().await?;
-            ranges.extend(parse_cloudflare_text(&body, CloudProvider::Cloudflare, true)?);
+            ranges.extend(parse_cloudflare_text(
+                &body,
+                CloudProvider::Cloudflare,
+                true,
+            )?);
         }
     }
 
@@ -1262,7 +1481,11 @@ fn parse_digitalocean_ranges(csv: &str) -> Result<Vec<CloudRange>> {
     Ok(ranges)
 }
 
-fn parse_cloudflare_text(text: &str, provider: CloudProvider, _is_v6: bool) -> Result<Vec<CloudRange>> {
+fn parse_cloudflare_text(
+    text: &str,
+    provider: CloudProvider,
+    _is_v6: bool,
+) -> Result<Vec<CloudRange>> {
     let mut ranges = Vec::new();
 
     for line in text.lines() {
@@ -1284,14 +1507,18 @@ fn parse_cloudflare_text(text: &str, provider: CloudProvider, _is_v6: bool) -> R
     Ok(ranges)
 }
 
-async fn fetch_all_cloud_ranges(providers: Option<Vec<CloudProvider>>) -> HashMap<CloudProvider, Result<Vec<CloudRange>>> {
-    let providers = providers.unwrap_or_else(|| vec![
-        CloudProvider::AWS,
-        CloudProvider::Azure,
-        CloudProvider::GCP,
-        CloudProvider::DigitalOcean,
-        CloudProvider::Cloudflare,
-    ]);
+async fn fetch_all_cloud_ranges(
+    providers: Option<Vec<CloudProvider>>,
+) -> HashMap<CloudProvider, Result<Vec<CloudRange>>> {
+    let providers = providers.unwrap_or_else(|| {
+        vec![
+            CloudProvider::AWS,
+            CloudProvider::Azure,
+            CloudProvider::GCP,
+            CloudProvider::DigitalOcean,
+            CloudProvider::Cloudflare,
+        ]
+    });
 
     let mut handles = vec![];
 
@@ -1344,7 +1571,13 @@ fn store_cloud_ranges(conn: &Connection, ranges: &[CloudRange]) -> Result<()> {
     Ok(())
 }
 
-fn update_cloud_metadata(conn: &Connection, provider: CloudProvider, url: &str, count: usize, status: &str) -> Result<()> {
+fn update_cloud_metadata(
+    conn: &Connection,
+    provider: CloudProvider,
+    url: &str,
+    count: usize,
+    status: &str,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT OR REPLACE INTO cloud_range_metadata (provider, last_fetch_time, fetch_url, record_count, fetch_status)
@@ -1354,7 +1587,11 @@ fn update_cloud_metadata(conn: &Connection, provider: CloudProvider, url: &str, 
     Ok(())
 }
 
-fn should_refresh_cloud_ranges(conn: &Connection, provider: CloudProvider, max_age_hours: u64) -> Result<bool> {
+fn should_refresh_cloud_ranges(
+    conn: &Connection,
+    provider: CloudProvider,
+    max_age_hours: u64,
+) -> Result<bool> {
     let result: Option<String> = conn
         .query_row(
             "SELECT last_fetch_time FROM cloud_range_metadata WHERE provider = ?",
@@ -1383,13 +1620,15 @@ async fn load_or_fetch_cloud_cache(
     max_age_hours: u64,
     provider_filter: Option<Vec<CloudProvider>>,
 ) -> Result<CloudRangeCache> {
-    let providers = provider_filter.clone().unwrap_or_else(|| vec![
-        CloudProvider::AWS,
-        CloudProvider::Azure,
-        CloudProvider::GCP,
-        CloudProvider::DigitalOcean,
-        CloudProvider::Cloudflare,
-    ]);
+    let providers = provider_filter.clone().unwrap_or_else(|| {
+        vec![
+            CloudProvider::AWS,
+            CloudProvider::Azure,
+            CloudProvider::GCP,
+            CloudProvider::DigitalOcean,
+            CloudProvider::Cloudflare,
+        ]
+    });
 
     let mut needs_refresh = force_refresh || refresh;
 
@@ -1414,14 +1653,22 @@ async fn load_or_fetch_cloud_cache(
                 Ok(ranges) => {
                     let count = ranges.len();
                     if let Err(e) = store_cloud_ranges(conn, &ranges) {
-                        eprintln!("Warning: Failed to store {} ranges: {}", provider.as_str(), e);
+                        eprintln!(
+                            "Warning: Failed to store {} ranges: {}",
+                            provider.as_str(),
+                            e
+                        );
                         total_failed += 1;
                     } else {
                         let url = match provider {
                             CloudProvider::AWS => "https://ip-ranges.amazonaws.com/ip-ranges.json",
-                            CloudProvider::Azure => "https://www.microsoft.com/en-us/download/details.aspx?id=56519",
+                            CloudProvider::Azure => {
+                                "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
+                            }
                             CloudProvider::GCP => "https://www.gstatic.com/ipranges/cloud.json",
-                            CloudProvider::DigitalOcean => "https://digitalocean.com/geo/google.csv",
+                            CloudProvider::DigitalOcean => {
+                                "https://digitalocean.com/geo/google.csv"
+                            }
                             CloudProvider::Cloudflare => "https://www.cloudflare.com/ips-v4",
                         };
                         update_cloud_metadata(conn, provider, url, count, "success")?;
@@ -1437,7 +1684,10 @@ async fn load_or_fetch_cloud_cache(
         }
 
         if total_success > 0 {
-            eprintln!("Cloud ranges updated: {} succeeded, {} failed", total_success, total_failed);
+            eprintln!(
+                "Cloud ranges updated: {} succeeded, {} failed",
+                total_success, total_failed
+            );
         } else if total_failed > 0 {
             eprintln!("Warning: All cloud range fetches failed, will use cached data if available");
         }
@@ -1446,7 +1696,10 @@ async fn load_or_fetch_cloud_cache(
     CloudRangeCache::load_from_db(conn)
 }
 
-async fn perform_lookup_with_cloud(ip: &str, cloud_cache: Option<&CloudRangeCache>) -> (Option<String>, Option<String>) {
+async fn perform_lookup_with_cloud(
+    ip: &str,
+    cloud_cache: Option<&CloudRangeCache>,
+) -> (Option<String>, Option<String>) {
     let ip_clone = ip.to_string();
 
     let rdns = tokio::task::spawn_blocking(move || {
@@ -1455,7 +1708,10 @@ async fn perform_lookup_with_cloud(ip: &str, cloud_cache: Option<&CloudRangeCach
         } else {
             None
         }
-    }).await.ok().flatten();
+    })
+    .await
+    .ok()
+    .flatten();
 
     // Check cloud cache first
     if let Some(cache) = cloud_cache {
@@ -1488,7 +1744,7 @@ fn extract_org_from_whois(text: &str) -> Option<String> {
         r"(?i)^descr:\s*(.+)$",
         r"(?i)^netname:\s*(.+)$",
     ];
-    
+
     for pat in patterns {
         if let Ok(re) = Regex::new(pat) {
             for line in text.lines() {
@@ -1566,7 +1822,17 @@ fn init_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn get_ip_record(conn: &Connection, ip: &str) -> Option<(String, bool, Option<String>, Option<String>, Option<String>, bool)> {
+fn get_ip_record(
+    conn: &Connection,
+    ip: &str,
+) -> Option<(
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+)> {
     conn.query_row(
         "SELECT ip, is_v6, user_agent, reverse_dns, org, looked_up FROM ips WHERE ip = ?",
         [ip],
@@ -1580,7 +1846,8 @@ fn get_ip_record(conn: &Connection, ip: &str) -> Option<(String, bool, Option<St
                 row.get::<_, i32>(5)? != 0,
             ))
         },
-    ).ok()
+    )
+    .ok()
 }
 
 fn insert_ip(conn: &Connection, ip: &str, is_v6: bool, user_agent: Option<&str>) -> Result<()> {
@@ -1598,7 +1865,12 @@ fn insert_ip(conn: &Connection, ip: &str, is_v6: bool, user_agent: Option<&str>)
     Ok(())
 }
 
-fn update_ip_lookup(conn: &Connection, ip: &str, rdns: Option<&str>, org: Option<&str>) -> Result<()> {
+fn update_ip_lookup(
+    conn: &Connection,
+    ip: &str,
+    rdns: Option<&str>,
+    org: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "UPDATE ips SET looked_up = 1, reverse_dns = ?, org = ? WHERE ip = ?",
         params![rdns, org, ip],
@@ -1658,10 +1930,12 @@ mod tests {
             ]
         }"#;
 
-        pub const CLOUDFLARE_V4: &str = "104.21.48.0/20\n172.67.0.0/17\n\n# Comment line\n188.114.96.0/20";
+        pub const CLOUDFLARE_V4: &str =
+            "104.21.48.0/20\n172.67.0.0/17\n\n# Comment line\n188.114.96.0/20";
         pub const CLOUDFLARE_V6: &str = "2606:4700::/32\n2803:f800::/32";
 
-        pub const DIGITALOCEAN_CSV: &str = "ip,region\n164.90.241.0/24,nyc3\n167.99.0.0/16,sfo2\n159.65.0.0/16,lon1";
+        pub const DIGITALOCEAN_CSV: &str =
+            "ip,region\n164.90.241.0/24,nyc3\n167.99.0.0/16,sfo2\n159.65.0.0/16,lon1";
         pub const DIGITALOCEAN_CSV_EMPTY: &str = "ip,region";
         pub const DIGITALOCEAN_CSV_NO_HEADER: &str = "164.90.241.0/24,nyc3";
     }
@@ -1674,13 +1948,19 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         // Check IPv4 prefix
-        let ec2 = result.iter().find(|r| r.network.to_string() == "52.93.153.0/24").unwrap();
+        let ec2 = result
+            .iter()
+            .find(|r| r.network.to_string() == "52.93.153.0/24")
+            .unwrap();
         assert_eq!(ec2.provider, CloudProvider::AWS);
         assert_eq!(ec2.service.as_deref(), Some("EC2"));
         assert_eq!(ec2.region.as_deref(), Some("us-east-1"));
 
         // Check IPv6 prefix
-        let cf = result.iter().find(|r| r.network.to_string() == "2600:9000::/28").unwrap();
+        let cf = result
+            .iter()
+            .find(|r| r.network.to_string() == "2600:9000::/28")
+            .unwrap();
         assert_eq!(cf.service.as_deref(), Some("CLOUDFRONT"));
         assert_eq!(cf.region.as_deref(), Some("GLOBAL"));
     }
@@ -1702,13 +1982,19 @@ mod tests {
         let result = parse_azure_ranges(test_fixtures::AZURE_JSON).unwrap();
         assert_eq!(result.len(), 3);
 
-        let azure_cloud = result.iter().find(|r| r.network.to_string() == "20.118.137.0/24").unwrap();
+        let azure_cloud = result
+            .iter()
+            .find(|r| r.network.to_string() == "20.118.137.0/24")
+            .unwrap();
         assert_eq!(azure_cloud.provider, CloudProvider::Azure);
         assert_eq!(azure_cloud.service.as_deref(), Some("AzureCloud"));
         assert_eq!(azure_cloud.region.as_deref(), Some("westus2"));
 
         // Check IPv6
-        let ipv6 = result.iter().find(|r| r.network.to_string() == "2603:1030::/48").unwrap();
+        let ipv6 = result
+            .iter()
+            .find(|r| r.network.to_string() == "2603:1030::/48")
+            .unwrap();
         assert_eq!(ipv6.service.as_deref(), Some("AzureCloud"));
     }
 
@@ -1725,12 +2011,18 @@ mod tests {
         let result = parse_gcp_ranges(test_fixtures::GCP_JSON).unwrap();
         assert_eq!(result.len(), 2);
 
-        let ipv4 = result.iter().find(|r| r.network.to_string() == "34.1.208.0/20").unwrap();
+        let ipv4 = result
+            .iter()
+            .find(|r| r.network.to_string() == "34.1.208.0/20")
+            .unwrap();
         assert_eq!(ipv4.provider, CloudProvider::GCP);
         assert_eq!(ipv4.service, None);
         assert_eq!(ipv4.region.as_deref(), Some("africa-south1"));
 
-        let ipv6 = result.iter().find(|r| r.network.to_string() == "2600:1900::/28").unwrap();
+        let ipv6 = result
+            .iter()
+            .find(|r| r.network.to_string() == "2600:1900::/28")
+            .unwrap();
         assert_eq!(ipv6.region.as_deref(), Some("us-central1"));
     }
 
@@ -1752,7 +2044,10 @@ mod tests {
         let result = parse_digitalocean_ranges(test_fixtures::DIGITALOCEAN_CSV).unwrap();
         assert_eq!(result.len(), 3);
 
-        let nyc3 = result.iter().find(|r| r.network.to_string() == "164.90.241.0/24").unwrap();
+        let nyc3 = result
+            .iter()
+            .find(|r| r.network.to_string() == "164.90.241.0/24")
+            .unwrap();
         assert_eq!(nyc3.provider, CloudProvider::DigitalOcean);
         assert_eq!(nyc3.service, None);
         assert_eq!(nyc3.region.as_deref(), Some("nyc3"));
@@ -1773,10 +2068,18 @@ mod tests {
 
     #[test]
     fn test_parse_cloudflare_text() {
-        let result = parse_cloudflare_text(test_fixtures::CLOUDFLARE_V4, CloudProvider::Cloudflare, false).unwrap();
+        let result = parse_cloudflare_text(
+            test_fixtures::CLOUDFLARE_V4,
+            CloudProvider::Cloudflare,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.len(), 3); // 3 valid CIDRs, skipping comment and empty line
 
-        let range1 = result.iter().find(|r| r.network.to_string() == "104.21.48.0/20").unwrap();
+        let range1 = result
+            .iter()
+            .find(|r| r.network.to_string() == "104.21.48.0/20")
+            .unwrap();
         assert_eq!(range1.provider, CloudProvider::Cloudflare);
         assert_eq!(range1.service, None);
         assert_eq!(range1.region, None);
@@ -1784,10 +2087,17 @@ mod tests {
 
     #[test]
     fn test_parse_cloudflare_text_ipv6() {
-        let result = parse_cloudflare_text(test_fixtures::CLOUDFLARE_V6, CloudProvider::Cloudflare, true).unwrap();
+        let result = parse_cloudflare_text(
+            test_fixtures::CLOUDFLARE_V6,
+            CloudProvider::Cloudflare,
+            true,
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
 
-        assert!(result.iter().any(|r| r.network.to_string() == "2606:4700::/32"));
+        assert!(result
+            .iter()
+            .any(|r| r.network.to_string() == "2606:4700::/32"));
     }
 
     #[test]
@@ -1798,7 +2108,12 @@ mod tests {
 
     #[test]
     fn test_parse_cloudflare_text_invalid_cidr() {
-        let result = parse_cloudflare_text("invalid.cidr.here\n104.21.48.0/20", CloudProvider::Cloudflare, false).unwrap();
+        let result = parse_cloudflare_text(
+            "invalid.cidr.here\n104.21.48.0/20",
+            CloudProvider::Cloudflare,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.len(), 1); // Should skip invalid CIDR
     }
 
@@ -2181,7 +2496,14 @@ mod tests {
         let conn = Connection::open(temp_file.path()).unwrap();
         init_db(&conn).unwrap();
 
-        update_cloud_metadata(&conn, CloudProvider::AWS, "https://example.com", 100, "success").unwrap();
+        update_cloud_metadata(
+            &conn,
+            CloudProvider::AWS,
+            "https://example.com",
+            100,
+            "success",
+        )
+        .unwrap();
 
         let (provider, url, count, status): (String, String, i64, String) = conn
             .query_row(
@@ -2203,8 +2525,22 @@ mod tests {
         let conn = Connection::open(temp_file.path()).unwrap();
         init_db(&conn).unwrap();
 
-        update_cloud_metadata(&conn, CloudProvider::AWS, "https://example.com", 100, "success").unwrap();
-        update_cloud_metadata(&conn, CloudProvider::AWS, "https://example.com", 200, "success").unwrap();
+        update_cloud_metadata(
+            &conn,
+            CloudProvider::AWS,
+            "https://example.com",
+            100,
+            "success",
+        )
+        .unwrap();
+        update_cloud_metadata(
+            &conn,
+            CloudProvider::AWS,
+            "https://example.com",
+            200,
+            "success",
+        )
+        .unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -2291,8 +2627,14 @@ mod tests {
         assert_eq!(CloudProvider::from_str("AWS"), Some(CloudProvider::AWS));
         assert_eq!(CloudProvider::from_str("azure"), Some(CloudProvider::Azure));
         assert_eq!(CloudProvider::from_str("gcp"), Some(CloudProvider::GCP));
-        assert_eq!(CloudProvider::from_str("digitalocean"), Some(CloudProvider::DigitalOcean));
-        assert_eq!(CloudProvider::from_str("cloudflare"), Some(CloudProvider::Cloudflare));
+        assert_eq!(
+            CloudProvider::from_str("digitalocean"),
+            Some(CloudProvider::DigitalOcean)
+        );
+        assert_eq!(
+            CloudProvider::from_str("cloudflare"),
+            Some(CloudProvider::Cloudflare)
+        );
         assert_eq!(CloudProvider::from_str("invalid"), None);
     }
 
@@ -2352,8 +2694,14 @@ mod tests {
         let result = parse_gcp_ranges(json).unwrap();
         assert_eq!(result.len(), 3);
 
-        let ipv4_count = result.iter().filter(|r| matches!(r.network, IpNetwork::V4(_))).count();
-        let ipv6_count = result.iter().filter(|r| matches!(r.network, IpNetwork::V6(_))).count();
+        let ipv4_count = result
+            .iter()
+            .filter(|r| matches!(r.network, IpNetwork::V4(_)))
+            .count();
+        let ipv6_count = result
+            .iter()
+            .filter(|r| matches!(r.network, IpNetwork::V6(_)))
+            .count();
 
         assert_eq!(ipv4_count, 2);
         assert_eq!(ipv6_count, 1);
@@ -2473,18 +2821,9 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts) = parse_file(
-            &path,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+            &path, None, None, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 6);
         assert_eq!(ip_counts.len(), 5); // 5 unique IPs
@@ -2527,7 +2866,8 @@ mod tests {
             Some(","),
             Some(1), // IP in field 1
             Some(4), // UA in field 4
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 2);
@@ -2561,7 +2901,8 @@ mod tests {
             None,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 2); // Only GET requests
         assert_eq!(ip_counts.len(), 2);
@@ -2595,7 +2936,8 @@ mod tests {
             None,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 1); // Only curl
         assert_eq!(ip_counts.len(), 1);
@@ -2669,10 +3011,22 @@ mod tests {
     #[test]
     fn test_apply_filters_top() {
         let mut counts = HashMap::new();
-        counts.insert("192.168.1.1".to_string(), (100u64, false, Some("UA1".to_string())));
-        counts.insert("192.168.1.2".to_string(), (50u64, false, Some("UA2".to_string())));
-        counts.insert("192.168.1.3".to_string(), (25u64, false, Some("UA3".to_string())));
-        counts.insert("192.168.1.4".to_string(), (10u64, false, Some("UA4".to_string())));
+        counts.insert(
+            "192.168.1.1".to_string(),
+            (100u64, false, Some("UA1".to_string())),
+        );
+        counts.insert(
+            "192.168.1.2".to_string(),
+            (50u64, false, Some("UA2".to_string())),
+        );
+        counts.insert(
+            "192.168.1.3".to_string(),
+            (25u64, false, Some("UA3".to_string())),
+        );
+        counts.insert(
+            "192.168.1.4".to_string(),
+            (10u64, false, Some("UA4".to_string())),
+        );
 
         let filtered = apply_filters(counts, Some("2"), None);
         assert_eq!(filtered.len(), 2);
@@ -2685,10 +3039,22 @@ mod tests {
     #[test]
     fn test_apply_filters_percentage() {
         let mut counts = HashMap::new();
-        counts.insert("192.168.1.1".to_string(), (100u64, false, Some("UA1".to_string())));
-        counts.insert("192.168.1.2".to_string(), (50u64, false, Some("UA2".to_string())));
-        counts.insert("192.168.1.3".to_string(), (25u64, false, Some("UA3".to_string())));
-        counts.insert("192.168.1.4".to_string(), (10u64, false, Some("UA4".to_string())));
+        counts.insert(
+            "192.168.1.1".to_string(),
+            (100u64, false, Some("UA1".to_string())),
+        );
+        counts.insert(
+            "192.168.1.2".to_string(),
+            (50u64, false, Some("UA2".to_string())),
+        );
+        counts.insert(
+            "192.168.1.3".to_string(),
+            (25u64, false, Some("UA3".to_string())),
+        );
+        counts.insert(
+            "192.168.1.4".to_string(),
+            (10u64, false, Some("UA4".to_string())),
+        );
 
         let filtered = apply_filters(counts, Some("50%"), None);
         assert_eq!(filtered.len(), 2); // 50% of 4 = 2
@@ -2697,10 +3063,22 @@ mod tests {
     #[test]
     fn test_apply_filters_min() {
         let mut counts = HashMap::new();
-        counts.insert("192.168.1.1".to_string(), (100u64, false, Some("UA1".to_string())));
-        counts.insert("192.168.1.2".to_string(), (50u64, false, Some("UA2".to_string())));
-        counts.insert("192.168.1.3".to_string(), (25u64, false, Some("UA3".to_string())));
-        counts.insert("192.168.1.4".to_string(), (10u64, false, Some("UA4".to_string())));
+        counts.insert(
+            "192.168.1.1".to_string(),
+            (100u64, false, Some("UA1".to_string())),
+        );
+        counts.insert(
+            "192.168.1.2".to_string(),
+            (50u64, false, Some("UA2".to_string())),
+        );
+        counts.insert(
+            "192.168.1.3".to_string(),
+            (25u64, false, Some("UA3".to_string())),
+        );
+        counts.insert(
+            "192.168.1.4".to_string(),
+            (10u64, false, Some("UA4".to_string())),
+        );
 
         let filtered = apply_filters(counts, None, Some(30));
         assert_eq!(filtered.len(), 2); // Only >= 30
@@ -2733,13 +3111,15 @@ mod tests {
 
         // Should load from DB without fetching (max_age = 168 hours = 7 days)
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let cache = rt.block_on(load_or_fetch_cloud_cache(
-            &conn,
-            false,  // refresh
-            false,  // force_refresh
-            168,    // max_age_hours
-            Some(vec![CloudProvider::AWS]),
-        )).unwrap();
+        let cache = rt
+            .block_on(load_or_fetch_cloud_cache(
+                &conn,
+                false, // refresh
+                false, // force_refresh
+                168,   // max_age_hours
+                Some(vec![CloudProvider::AWS]),
+            ))
+            .unwrap();
 
         assert_eq!(cache.ipv4_ranges.len(), 1);
         assert_eq!(cache.ipv4_ranges[0].provider, CloudProvider::AWS);
@@ -2758,18 +3138,9 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts) = parse_file(
-            &path,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+            &path, None, None, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 3);
@@ -2798,18 +3169,9 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts) = parse_file(
-            &path,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+            &path, None, None, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 4);
         assert_eq!(ip_counts.len(), 4);
@@ -2832,18 +3194,9 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts) = parse_file(
-            &path,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+            &path, None, None, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 3);
