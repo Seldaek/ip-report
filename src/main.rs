@@ -119,6 +119,9 @@ struct Args {
     /// Only fetch specific providers (comma-separated: aws,azure,gcp,digitalocean,cloudflare)
     #[arg(long)]
     cloud_providers: Option<String>,
+    /// Stop processing after this many lines (useful for sampling large files)
+    #[arg(long)]
+    max_lines: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -334,6 +337,7 @@ fn main() -> Result<()> {
         args.delimiter.as_deref(),
         args.ip_field,
         args.ua_field,
+        args.max_lines,
     )?;
     let total_ips = ip_counts.len();
     let filtered = apply_filters(ip_counts, args.top.as_deref(), args.min);
@@ -422,6 +426,7 @@ fn parse_file(
     delimiter: Option<&str>,
     ip_field: Option<usize>,
     ua_field: Option<usize>,
+    max_lines: Option<u64>,
 ) -> Result<(
     HashMap<String, (u64, bool, Option<String>)>,
     u64,
@@ -539,16 +544,27 @@ fn parse_file(
 
         total_lines += 1;
 
+        // Check if we've reached max_lines
+        if let Some(max) = max_lines {
+            if total_lines >= max {
+                break;
+            }
+        }
+
         let mut record_hit = |ip: IpAddr, ua: Option<String>| {
             let key = ip.to_string();
             let is_v6 = ip.is_ipv6();
             let entry = counts.entry(key).or_insert((0, is_v6, HashMap::new()));
             entry.0 += 1;
             if let Some(ref ua_str) = ua {
-                *entry.2.entry(ua_str.clone()).or_insert(0) += 1;
-                // Track global user agent counts (base name only)
-                let ua_base = extract_ua_base(ua_str);
-                *global_ua_counts.entry(ua_base).or_insert(0) += 1;
+                if !ua_str.is_empty() {
+                    *entry.2.entry(ua_str.clone()).or_insert(0) += 1;
+                    // Track global user agent counts (base name only)
+                    let ua_base = extract_ua_base(ua_str);
+                    if !ua_base.is_empty() {
+                        *global_ua_counts.entry(ua_base).or_insert(0) += 1;
+                    }
+                }
             }
         };
 
