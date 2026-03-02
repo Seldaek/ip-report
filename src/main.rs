@@ -974,30 +974,33 @@ fn apply_filters(
     min: Option<u64>,
     sort_by: SortBy,
 ) -> Vec<(String, u64, bool, Option<String>, u64)> {
-    let mut sorted: Vec<_> = counts
-        .iter()
-        .map(|(ip, (c, v6, ua, bytes))| (ip.clone(), *c, *v6, ua.clone(), *bytes))
-        .collect();
+    // Sort references to avoid cloning all entries upfront
+    let mut refs: Vec<_> = counts.iter().collect();
     match sort_by {
-        SortBy::Hits => sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
-        SortBy::Bandwidth => sorted.sort_by(|a, b| b.4.cmp(&a.4).then_with(|| a.0.cmp(&b.0))),
+        SortBy::Hits => refs.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0))),
+        SortBy::Bandwidth => {
+            refs.sort_by(|a, b| b.1 .3.cmp(&a.1 .3).then_with(|| a.0.cmp(b.0)))
+        }
     }
 
     if let Some(top_str) = top {
         let limit = if top_str.ends_with('%') {
             let pct: f64 = top_str.trim_end_matches('%').parse().unwrap_or(100.0);
-            ((sorted.len() as f64 * pct / 100.0).ceil() as usize).max(1)
+            ((refs.len() as f64 * pct / 100.0).ceil() as usize).max(1)
         } else {
-            top_str.parse().unwrap_or(sorted.len())
+            top_str.parse().unwrap_or(refs.len())
         };
-        sorted.truncate(limit);
+        refs.truncate(limit);
     }
 
     if let Some(min_count) = min {
-        sorted.retain(|(_, c, _, _, _)| *c >= min_count);
+        refs.retain(|(_, (c, _, _, _))| *c >= min_count);
     }
 
-    sorted
+    // Only clone the survivors
+    refs.into_iter()
+        .map(|(ip, (c, v6, ua, bytes))| (ip.clone(), *c, *v6, ua.clone(), *bytes))
+        .collect()
 }
 
 async fn run_lookups_and_display(
@@ -1539,6 +1542,25 @@ async fn run_tui(
                         }
                         KeyCode::Char('s') => {
                             dc.sort_by = dc.sort_by.toggle();
+                            // Show "Resorting..." before the blocking work
+                            terminal.draw(|f| {
+                                let area = f.area();
+                                let msg = format!(" Resorting by {}... ", dc.sort_by.label());
+                                let w = msg.len() as u16 + 2;
+                                let h = 3u16;
+                                let popup = Rect::new(
+                                    area.width.saturating_sub(w) / 2,
+                                    area.height.saturating_sub(h) / 2,
+                                    w.min(area.width),
+                                    h.min(area.height),
+                                );
+                                f.render_widget(Clear, popup);
+                                f.render_widget(
+                                    Paragraph::new(msg)
+                                        .block(Block::default().borders(Borders::ALL)),
+                                    popup,
+                                );
+                            })?;
                             let new_handles = reselect_records(
                                 &full_ip_counts,
                                 top.as_deref(),
