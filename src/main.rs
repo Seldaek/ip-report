@@ -77,6 +77,16 @@ impl GroupBy {
     }
 }
 
+struct DisplayConfig {
+    has_bytes: bool,
+    sort_by: SortBy,
+    show_rdns: bool,
+    show_ua: bool,
+    show_org: bool,
+    cloud_detail: bool,
+    group_by: GroupBy,
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -128,6 +138,191 @@ fn effective_org(org: &str, cloud_detail: bool) -> String {
         prefix.to_string()
     } else {
         org.to_string()
+    }
+}
+
+struct ParsedLine {
+    ip: IpAddr,
+    user_agent: Option<String>,
+    bytes: u64,
+}
+
+trait LogParser {
+    fn parse_line(&self, line: &str) -> Option<ParsedLine>;
+    fn has_bytes(&self) -> bool;
+}
+
+struct NginxParser {
+    re: Regex,
+}
+
+impl NginxParser {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            re: Regex::new(r#"^(\S+) \S+ \S+ \[[^\]]+\] "[^"]*" \d+ (\d+) "[^"]*" "([^"]*)"#)?,
+        })
+    }
+}
+
+impl LogParser for NginxParser {
+    fn parse_line(&self, line: &str) -> Option<ParsedLine> {
+        let cap = self.re.captures(line)?;
+        let ip: IpAddr = cap.get(1)?.as_str().parse().ok()?;
+        let bytes: u64 = cap
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let ua = cap
+            .get(3)
+            .map(|m| m.as_str().to_string())
+            .filter(|s| !s.is_empty());
+        Some(ParsedLine {
+            ip,
+            user_agent: ua,
+            bytes,
+        })
+    }
+
+    fn has_bytes(&self) -> bool {
+        true
+    }
+}
+
+struct DelimiterParser {
+    delimiter: String,
+    ip_field: Option<usize>,
+    ua_field: Option<usize>,
+    bytes_field: Option<usize>,
+}
+
+impl DelimiterParser {
+    fn new(
+        delimiter: &str,
+        ip_field: Option<usize>,
+        ua_field: Option<usize>,
+        bytes_field: Option<usize>,
+    ) -> Self {
+        Self {
+            delimiter: delimiter.to_string(),
+            ip_field,
+            ua_field,
+            bytes_field,
+        }
+    }
+}
+
+impl LogParser for DelimiterParser {
+    fn parse_line(&self, line: &str) -> Option<ParsedLine> {
+        let fields: Vec<&str> = line.split(&self.delimiter).collect();
+
+        let ip_str = if let Some(idx) = self.ip_field {
+            fields.get(idx.saturating_sub(1)).copied()
+        } else {
+            fields.iter().find(|f| f.parse::<IpAddr>().is_ok()).copied()
+        };
+
+        let ip: IpAddr = ip_str?.parse().ok()?;
+
+        let ua = if let Some(idx) = self.ua_field {
+            fields
+                .get(idx.saturating_sub(1))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        } else {
+            fields
+                .iter()
+                .rev()
+                .find(|f| !f.is_empty())
+                .map(|s| s.to_string())
+        };
+
+        let bytes: u64 = self
+            .bytes_field
+            .and_then(|idx| fields.get(idx.saturating_sub(1)))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        Some(ParsedLine {
+            ip,
+            user_agent: ua,
+            bytes,
+        })
+    }
+
+    fn has_bytes(&self) -> bool {
+        self.bytes_field.is_some()
+    }
+}
+
+struct GenericParser {
+    ipv4_re: Regex,
+    ipv6_re: Regex,
+}
+
+impl GenericParser {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            ipv4_re: Regex::new(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")?,
+            ipv6_re: Regex::new(
+                r"\b((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?::[0-9a-fA-F]{1,4}){1,7}|::)\b",
+            )?,
+        })
+    }
+}
+
+impl LogParser for GenericParser {
+    fn parse_line(&self, line: &str) -> Option<ParsedLine> {
+        // Extract UA from last quoted string
+        let ua = if let Some(last_quote) = line.rfind('"') {
+            line[..last_quote]
+                .rfind('"')
+                .map(|start| line[start + 1..last_quote].to_string())
+        } else {
+            None
+        };
+
+        // Try first word as IP
+        if let Some(first_word) = line.split_whitespace().next() {
+            if let Ok(ip) = first_word.parse::<IpAddr>() {
+                return Some(ParsedLine {
+                    ip,
+                    user_agent: ua,
+                    bytes: 0,
+                });
+            }
+        }
+
+        // Try ipv4 regex
+        if let Some(cap) = self.ipv4_re.captures(line) {
+            if let Some(m) = cap.get(1) {
+                if let Ok(ip) = m.as_str().parse::<IpAddr>() {
+                    return Some(ParsedLine {
+                        ip,
+                        user_agent: ua,
+                        bytes: 0,
+                    });
+                }
+            }
+        }
+
+        // Try ipv6 regex
+        if let Some(cap) = self.ipv6_re.captures(line) {
+            if let Some(m) = cap.get(1) {
+                if let Ok(ip) = m.as_str().parse::<IpAddr>() {
+                    return Some(ParsedLine {
+                        ip,
+                        user_agent: ua,
+                        bytes: 0,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    fn has_bytes(&self) -> bool {
+        false
     }
 }
 
@@ -460,16 +655,26 @@ fn main() -> Result<()> {
         ),
     };
 
+    // Build the log parser based on format/delimiter args
+    let parser: Box<dyn LogParser> = if args.format.as_deref() == Some("nginx") {
+        Box::new(NginxParser::new()?)
+    } else if let Some(ref delim) = args.delimiter {
+        Box::new(DelimiterParser::new(
+            delim,
+            args.ip_field,
+            args.ua_field,
+            args.bytes_field,
+        ))
+    } else {
+        Box::new(GenericParser::new()?)
+    };
+
     let (ip_counts, total_lines, global_ua_counts, global_ua_bytes) = parse_file(
         &args.file,
         args.filter.as_deref(),
         args.ua_filter.as_deref(),
-        args.delimiter.as_deref(),
-        args.ip_field,
-        args.ua_field,
         args.max_lines,
-        args.bytes_field,
-        args.format.as_deref(),
+        parser.as_ref(),
     )?;
     let total_ips = ip_counts.len();
     let filtered = apply_filters(ip_counts, args.top.as_deref(), args.min, sort_by);
@@ -486,35 +691,57 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let has_bytes = args.bytes_field.is_some() || args.format.as_deref() == Some("nginx");
+    let has_bytes = parser.has_bytes();
+
+    let dc = DisplayConfig {
+        has_bytes,
+        sort_by,
+        show_rdns: true,
+        show_ua: true,
+        show_org: true,
+        cloud_detail: true,
+        group_by: GroupBy::Ip,
+    };
 
     if args.no_lookup {
         println!("Total lines: {}\n", total_lines);
         if has_bytes {
+            let total_bytes: u64 = filtered.iter().map(|(_, _, _, _, bytes)| bytes).sum();
             println!(
-                "{:<8} {:<6} {:<10} {:<45} {}",
-                "Count", "%", "Bandwidth", "IP", "User Agent"
+                "{:<8} {:<6} {:<10} {:<6} {:<45} {}",
+                "Count", "%", "Bandwidth", "BW%", "IP", "User Agent"
             );
-        } else {
-            println!("{:<8} {:<6} {:<45} {}", "Count", "%", "IP", "User Agent");
-        }
-        println!("{}", "-".repeat(if has_bytes { 120 } else { 110 }));
-        for (ip, count, _is_v6, ua, bytes) in &filtered {
-            let pct = if total_lines > 0 {
-                (*count as f64 / total_lines as f64) * 100.0
-            } else {
-                0.0
-            };
-            if has_bytes {
+            println!("{}", "-".repeat(126));
+            for (ip, count, _is_v6, ua, bytes) in &filtered {
+                let pct = if total_lines > 0 {
+                    (*count as f64 / total_lines as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let bw_pct = if total_bytes > 0 {
+                    (*bytes as f64 / total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
                 println!(
-                    "{:<8} {:<6.2} {:<10} {:<45} {}",
+                    "{:<8} {:<6.2} {:<10} {:<6.2} {:<45} {}",
                     count,
                     pct,
                     format_bytes(*bytes),
+                    bw_pct,
                     ip,
                     ua.as_deref().unwrap_or("-")
                 );
-            } else {
+            }
+        } else {
+            println!("{:<8} {:<6} {:<45} {}", "Count", "%", "IP", "User Agent");
+            println!("{}", "-".repeat(110));
+            for (ip, count, _is_v6, ua, _bytes) in &filtered {
+                let pct = if total_lines > 0 {
+                    (*count as f64 / total_lines as f64) * 100.0
+                } else {
+                    0.0
+                };
                 println!(
                     "{:<8} {:<6.2} {:<45} {}",
                     count,
@@ -567,8 +794,7 @@ fn main() -> Result<()> {
         cloud_cache,
         global_ua_counts,
         global_ua_bytes,
-        has_bytes,
-        sort_by,
+        dc,
     ))?;
 
     Ok(())
@@ -578,12 +804,8 @@ fn parse_file(
     path: &PathBuf,
     filter: Option<&str>,
     ua_filter: Option<&str>,
-    delimiter: Option<&str>,
-    ip_field: Option<usize>,
-    ua_field: Option<usize>,
     max_lines: Option<u64>,
-    bytes_field: Option<usize>,
-    format: Option<&str>,
+    parser: &dyn LogParser,
 ) -> Result<(
     HashMap<String, (u64, bool, Option<String>, u64)>,
     u64,
@@ -603,35 +825,9 @@ fn parse_file(
         .transpose()
         .context("Invalid --ua-filter regex")?;
 
-    // Nginx combined log format regex:
-    // $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"
-    let nginx_re = if format == Some("nginx") {
-        Some(Regex::new(
-            r#"^(\S+) \S+ \S+ \[[^\]]+\] "[^"]*" \d+ (\d+) "[^"]*" "([^"]*)"#,
-        )?)
-    } else {
-        None
-    };
-
-    // Only compile regex if not using delimiter or nginx mode
-    let ipv4_re = if delimiter.is_none() && nginx_re.is_none() {
-        Some(Regex::new(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")?)
-    } else {
-        None
-    };
-    let ipv6_re = if delimiter.is_none() && nginx_re.is_none() {
-        Some(Regex::new(
-            r"\b((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}|:(?::[0-9a-fA-F]{1,4}){1,7}|::)\b",
-        )?)
-    } else {
-        None
-    };
-
     // Track (count, is_v6, ua_counts, bytes)
     let mut counts: HashMap<String, (u64, bool, HashMap<String, u64>, u64)> = HashMap::new();
-    // Track global user agent counts (base name without version)
     let mut global_ua_counts: HashMap<String, u64> = HashMap::new();
-    // Track global user agent bytes (base name without version)
     let mut global_ua_bytes: HashMap<String, u64> = HashMap::new();
     let mut total_lines: u64 = 0;
     let mut bytes_read: u64 = 0;
@@ -668,66 +864,13 @@ fn parse_file(
             }
         }
 
-        let (ip_str, user_agent, bytes_value) = if let Some(ref re) = nginx_re {
-            // Nginx combined log format: single regex extracts IP, bytes, UA
-            if let Some(cap) = re.captures(line) {
-                let ip = cap.get(1).map(|m| m.as_str().to_string());
-                let bw: u64 = cap
-                    .get(2)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(0);
-                let ua = cap
-                    .get(3)
-                    .map(|m| m.as_str().to_string())
-                    .filter(|s| !s.is_empty());
-                (ip, ua, bw)
-            } else {
-                continue;
-            }
-        } else if let Some(delim) = delimiter {
-            let fields: Vec<&str> = line.split(delim).collect();
-
-            let ip = if let Some(idx) = ip_field {
-                fields.get(idx.saturating_sub(1)).map(|s| *s)
-            } else {
-                fields
-                    .iter()
-                    .find(|f| f.parse::<IpAddr>().is_ok())
-                    .map(|s| *s)
-            };
-
-            let ua = if let Some(idx) = ua_field {
-                fields
-                    .get(idx.saturating_sub(1))
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            } else {
-                fields
-                    .iter()
-                    .rev()
-                    .find(|f| !f.is_empty())
-                    .map(|s| s.to_string())
-            };
-
-            let bw: u64 = bytes_field
-                .and_then(|idx| fields.get(idx.saturating_sub(1)))
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
-
-            (ip.map(|s| s.to_string()), ua, bw)
-        } else {
-            let ua = if let Some(last_quote) = line.rfind('"') {
-                line[..last_quote]
-                    .rfind('"')
-                    .map(|start| line[start + 1..last_quote].to_string())
-            } else {
-                None
-            };
-            (None, ua, 0u64)
+        let parsed = match parser.parse_line(line) {
+            Some(p) => p,
+            None => continue,
         };
 
         if let Some(ref re) = ua_filter_re {
-            match &user_agent {
+            match &parsed.user_agent {
                 Some(ua) if re.is_match(ua) => {}
                 _ => continue,
             }
@@ -735,68 +878,24 @@ fn parse_file(
 
         total_lines += 1;
 
-        // Check if we've reached max_lines
         if let Some(max) = max_lines {
             if total_lines >= max {
                 break;
             }
         }
 
-        let mut record_hit = |ip: IpAddr, ua: Option<String>, bw: u64| {
-            let key = ip.to_string();
-            let is_v6 = ip.is_ipv6();
-            let entry = counts.entry(key).or_insert((0, is_v6, HashMap::new(), 0));
-            entry.0 += 1;
-            entry.3 += bw;
-            if let Some(ref ua_str) = ua {
-                if !ua_str.is_empty() {
-                    *entry.2.entry(ua_str.clone()).or_insert(0) += 1;
-                    // Track global user agent counts (base name only)
-                    let ua_base = extract_ua_base(ua_str);
-                    if !ua_base.is_empty() {
-                        *global_ua_counts.entry(ua_base.clone()).or_insert(0) += 1;
-                        *global_ua_bytes.entry(ua_base).or_insert(0) += bw;
-                    }
-                }
-            }
-        };
-
-        if let Some(ref ip_s) = ip_str {
-            if let Ok(ip) = ip_s.parse::<IpAddr>() {
-                record_hit(ip, user_agent, bytes_value);
-                continue;
-            }
-        }
-
-        if delimiter.is_some() {
-            continue;
-        }
-
-        // Fast path: first word is IP
-        if let Some(first_word) = line.split_whitespace().next() {
-            if let Ok(ip) = first_word.parse::<IpAddr>() {
-                record_hit(ip, user_agent, bytes_value);
-                continue;
-            }
-        }
-
-        if let Some(ref re) = ipv4_re {
-            if let Some(cap) = re.captures(line) {
-                if let Some(m) = cap.get(1) {
-                    if let Ok(ip) = m.as_str().parse::<IpAddr>() {
-                        record_hit(ip, user_agent, bytes_value);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if let Some(ref re) = ipv6_re {
-            if let Some(cap) = re.captures(line) {
-                if let Some(m) = cap.get(1) {
-                    if let Ok(ip) = m.as_str().parse::<IpAddr>() {
-                        record_hit(ip, user_agent, bytes_value);
-                    }
+        let key = parsed.ip.to_string();
+        let is_v6 = parsed.ip.is_ipv6();
+        let entry = counts.entry(key).or_insert((0, is_v6, HashMap::new(), 0));
+        entry.0 += 1;
+        entry.3 += parsed.bytes;
+        if let Some(ref ua_str) = parsed.user_agent {
+            if !ua_str.is_empty() {
+                *entry.2.entry(ua_str.clone()).or_insert(0) += 1;
+                let ua_base = extract_ua_base(ua_str);
+                if !ua_base.is_empty() {
+                    *global_ua_counts.entry(ua_base.clone()).or_insert(0) += 1;
+                    *global_ua_bytes.entry(ua_base).or_insert(0) += parsed.bytes;
                 }
             }
         }
@@ -862,8 +961,7 @@ async fn run_lookups_and_display(
     cloud_cache: Option<Arc<CloudRangeCache>>,
     global_ua_counts: HashMap<String, u64>,
     global_ua_bytes: HashMap<String, u64>,
-    has_bytes: bool,
-    sort_by: SortBy,
+    dc: DisplayConfig,
 ) -> Result<()> {
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
@@ -954,8 +1052,7 @@ async fn run_lookups_and_display(
             filter_desc,
             global_ua_counts,
             global_ua_bytes,
-            has_bytes,
-            sort_by,
+            dc,
         )
         .await?;
     } else {
@@ -964,37 +1061,49 @@ async fn run_lookups_and_display(
         }
         let recs = records.lock().unwrap();
         println!("Total lines: {}\n", total_lines);
-        if has_bytes {
+        if dc.has_bytes {
+            let total_bytes: u64 = recs.iter().map(|rec| rec.bytes).sum();
             println!(
-                "{:<8} {:<6} {:<10} {:<40} {:<40} {:<30} {:<12} {}",
-                "Count", "%", "Bandwidth", "IP", "Reverse DNS", "Org", "ASN", "User Agent"
+                "{:<8} {:<6} {:<10} {:<6} {:<40} {:<40} {:<30} {:<12} {}",
+                "Count", "%", "Bandwidth", "BW%", "IP", "Reverse DNS", "Org", "ASN", "User Agent"
             );
-        } else {
-            println!(
-                "{:<8} {:<6} {:<40} {:<40} {:<30} {:<12} {}",
-                "Count", "%", "IP", "Reverse DNS", "Org", "ASN", "User Agent"
-            );
-        }
-        println!("{}", "-".repeat(if has_bytes { 195 } else { 185 }));
-        for rec in recs.iter() {
-            let pct = if total_lines > 0 {
-                (rec.count as f64 / total_lines as f64) * 100.0
-            } else {
-                0.0
-            };
-            if has_bytes {
+            println!("{}", "-".repeat(201));
+            for rec in recs.iter() {
+                let pct = if total_lines > 0 {
+                    (rec.count as f64 / total_lines as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let bw_pct = if total_bytes > 0 {
+                    (rec.bytes as f64 / total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
                 println!(
-                    "{:<8} {:<6.2} {:<10} {:<40} {:<40} {:<30} {:<12} {}",
+                    "{:<8} {:<6.2} {:<10} {:<6.2} {:<40} {:<40} {:<30} {:<12} {}",
                     rec.count,
                     pct,
                     format_bytes(rec.bytes),
+                    bw_pct,
                     rec.ip,
                     truncate_str(rec.reverse_dns.as_deref().unwrap_or("-"), 38),
                     truncate_str(rec.org.as_deref().unwrap_or("-"), 28),
                     rec.asn.as_deref().unwrap_or("-"),
                     truncate_str(rec.user_agent.as_deref().unwrap_or("-"), 50)
                 );
-            } else {
+            }
+        } else {
+            println!(
+                "{:<8} {:<6} {:<40} {:<40} {:<30} {:<12} {}",
+                "Count", "%", "IP", "Reverse DNS", "Org", "ASN", "User Agent"
+            );
+            println!("{}", "-".repeat(185));
+            for rec in recs.iter() {
+                let pct = if total_lines > 0 {
+                    (rec.count as f64 / total_lines as f64) * 100.0
+                } else {
+                    0.0
+                };
                 println!(
                     "{:<8} {:<6.2} {:<40} {:<40} {:<30} {:<12} {}",
                     rec.count,
@@ -1019,8 +1128,7 @@ async fn run_tui(
     filter_desc: &str,
     global_ua_counts: HashMap<String, u64>,
     global_ua_bytes: HashMap<String, u64>,
-    has_bytes: bool,
-    sort_by: SortBy,
+    mut dc: DisplayConfig,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -1030,12 +1138,6 @@ async fn run_tui(
 
     let mut table_state = TableState::default();
     table_state.select(Some(0));
-    let mut group_by = GroupBy::Ip;
-    let mut sort_by = sort_by;
-    let mut show_rdns = true;
-    let mut show_ua = true;
-    let mut show_org = true;
-    let mut cloud_detail = true;
     let mut search_mode = false;
     let mut search_query = String::new();
 
@@ -1082,7 +1184,7 @@ async fn run_tui(
             };
 
             let mut filtered_recs = filtered_recs;
-            match sort_by {
+            match dc.sort_by {
                 SortBy::Hits => filtered_recs
                     .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.ip.cmp(&b.ip))),
                 SortBy::Bandwidth => filtered_recs
@@ -1097,22 +1199,16 @@ async fn run_tui(
                 String::new()
             };
 
-            match group_by {
+            match dc.group_by {
                 GroupBy::Ip => render_ip_view(
                     f,
                     &filtered_recs,
                     &mut table_state,
                     total_lines,
                     pending,
-                    show_rdns,
-                    show_ua,
-                    show_org,
-                    cloud_detail,
                     filter_desc,
-                    group_by,
                     &search_str,
-                    has_bytes,
-                    sort_by,
+                    &dc,
                 ),
                 GroupBy::Org => render_grouped_view(
                     f,
@@ -1122,15 +1218,12 @@ async fn run_tui(
                     pending,
                     filter_desc,
                     "Org",
-                    group_by,
-                    cloud_detail,
                     &search_str,
-                    has_bytes,
-                    sort_by,
+                    &dc,
                     |r| {
                         effective_org(
                             &r.org.clone().unwrap_or_else(|| "-".to_string()),
-                            cloud_detail,
+                            dc.cloud_detail,
                         )
                     },
                 ),
@@ -1142,16 +1235,13 @@ async fn run_tui(
                     pending,
                     filter_desc,
                     "ASN",
-                    group_by,
-                    cloud_detail,
                     &search_str,
-                    has_bytes,
-                    sort_by,
+                    &dc,
                     |r| {
                         r.asn.clone().unwrap_or_else(|| {
                             effective_org(
                                 &r.org.clone().unwrap_or_else(|| "-".to_string()),
-                                cloud_detail,
+                                dc.cloud_detail,
                             )
                         })
                     },
@@ -1164,11 +1254,8 @@ async fn run_tui(
                     total_lines,
                     pending,
                     filter_desc,
-                    group_by,
-                    cloud_detail,
                     &search_str,
-                    has_bytes,
-                    sort_by,
+                    &dc,
                 ),
             }
         })?;
@@ -1229,12 +1316,12 @@ async fn run_tui(
 
                     let filtered_owned: Vec<IpRecord> =
                         filtered_recs.iter().map(|r| (*r).clone()).collect();
-                    let len = match group_by {
+                    let len = match dc.group_by {
                         GroupBy::Ip => filtered_recs.len(),
                         GroupBy::Org => aggregate_by_field(&filtered_owned, |r| {
                             effective_org(
                                 &r.org.clone().unwrap_or_else(|| "-".to_string()),
-                                cloud_detail,
+                                dc.cloud_detail,
                             )
                         })
                         .len(),
@@ -1242,7 +1329,7 @@ async fn run_tui(
                             r.asn.clone().unwrap_or_else(|| {
                                 effective_org(
                                     &r.org.clone().unwrap_or_else(|| "-".to_string()),
-                                    cloud_detail,
+                                    dc.cloud_detail,
                                 )
                             })
                         })
@@ -1256,17 +1343,17 @@ async fn run_tui(
                             search_mode = true;
                         }
                         KeyCode::Char('g') => {
-                            group_by = group_by.next();
+                            dc.group_by = dc.group_by.next();
                             table_state.select(Some(0));
                         }
                         KeyCode::Char('b') => {
-                            sort_by = sort_by.toggle();
+                            dc.sort_by = dc.sort_by.toggle();
                             table_state.select(Some(0));
                         }
-                        KeyCode::Char('r') => show_rdns = !show_rdns,
-                        KeyCode::Char('u') => show_ua = !show_ua,
-                        KeyCode::Char('o') => show_org = !show_org,
-                        KeyCode::Char('c') => cloud_detail = !cloud_detail,
+                        KeyCode::Char('r') => dc.show_rdns = !dc.show_rdns,
+                        KeyCode::Char('u') => dc.show_ua = !dc.show_ua,
+                        KeyCode::Char('o') => dc.show_org = !dc.show_org,
+                        KeyCode::Char('c') => dc.cloud_detail = !dc.cloud_detail,
                         KeyCode::Down | KeyCode::Char('j') => {
                             let i = table_state.selected().unwrap_or(0);
                             table_state.select(Some((i + 1).min(len.saturating_sub(1))));
@@ -1329,35 +1416,33 @@ fn render_ip_view(
     table_state: &mut TableState,
     total_lines: u64,
     pending: usize,
-    show_rdns: bool,
-    show_ua: bool,
-    show_org: bool,
-    cloud_detail: bool,
     filter_desc: &str,
-    group_by: GroupBy,
     search_str: &str,
-    has_bytes: bool,
-    sort_by: SortBy,
+    dc: &DisplayConfig,
 ) {
     let mut header_cells = vec![Cell::from("Count"), Cell::from("%")];
-    if has_bytes {
+    if dc.has_bytes {
         header_cells.push(Cell::from("Bandwidth"));
+        header_cells.push(Cell::from("BW%"));
     }
     header_cells.push(Cell::from("IP"));
-    if show_rdns {
+    if dc.show_rdns {
         header_cells.push(Cell::from("Reverse DNS"));
     }
-    if show_org {
+    if dc.show_org {
         header_cells.push(Cell::from("Org"));
     }
-    if show_ua {
+    if dc.show_ua {
         header_cells.push(Cell::from("User Agent"));
     }
 
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
 
-    let visible_cols =
-        3 + show_rdns as usize + show_ua as usize + show_org as usize + has_bytes as usize;
+    let visible_cols = 3
+        + dc.show_rdns as usize
+        + dc.show_ua as usize
+        + dc.show_org as usize
+        + dc.has_bytes as usize * 2;
     let extra_width: usize = if visible_cols <= 4 {
         60
     } else if visible_cols == 5 {
@@ -1365,6 +1450,8 @@ fn render_ip_view(
     } else {
         0
     };
+
+    let total_bytes: u64 = recs.iter().map(|rec| rec.bytes).sum();
 
     let rows: Vec<Row> = recs
         .iter()
@@ -1379,21 +1466,27 @@ fn render_ip_view(
                 Cell::from(format!("{}{}", rec.count, status)),
                 Cell::from(format!("{:.2}", pct)),
             ];
-            if has_bytes {
+            if dc.has_bytes {
                 cells.push(Cell::from(format_bytes(rec.bytes)));
+                let bw_pct = if total_bytes > 0 {
+                    (rec.bytes as f64 / total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                cells.push(Cell::from(format!("{:.2}", bw_pct)));
             }
             cells.push(Cell::from(rec.ip.clone()));
-            if show_rdns {
+            if dc.show_rdns {
                 cells.push(Cell::from(truncate_str(
                     rec.reverse_dns.as_deref().unwrap_or("-"),
                     38 + extra_width,
                 )));
             }
-            if show_org {
-                let org_str = effective_org(rec.org.as_deref().unwrap_or("-"), cloud_detail);
+            if dc.show_org {
+                let org_str = effective_org(rec.org.as_deref().unwrap_or("-"), dc.cloud_detail);
                 cells.push(Cell::from(truncate_str(&org_str, 25 + extra_width)));
             }
-            if show_ua {
+            if dc.show_ua {
                 cells.push(Cell::from(truncate_str(
                     rec.user_agent.as_deref().unwrap_or("-"),
                     40 + extra_width,
@@ -1404,26 +1497,27 @@ fn render_ip_view(
         .collect();
 
     let mut widths = vec![Constraint::Length(10), Constraint::Length(6)];
-    if has_bytes {
+    if dc.has_bytes {
         widths.push(Constraint::Length(10));
+        widths.push(Constraint::Length(6));
     }
     widths.push(Constraint::Length(40));
-    if show_rdns {
+    if dc.show_rdns {
         widths.push(Constraint::Length((40 + extra_width) as u16));
     }
-    if show_org {
+    if dc.show_org {
         widths.push(Constraint::Length((27 + extra_width) as u16));
     }
-    if show_ua {
+    if dc.show_ua {
         widths.push(Constraint::Min(20));
     }
 
     let toggles = format!(
         "r:{} u:{} o:{} c:{}",
-        if show_rdns { "on" } else { "off" },
-        if show_ua { "on" } else { "off" },
-        if show_org { "on" } else { "off" },
-        if cloud_detail { "detail" } else { "agg" },
+        if dc.show_rdns { "on" } else { "off" },
+        if dc.show_ua { "on" } else { "off" },
+        if dc.show_org { "on" } else { "off" },
+        if dc.cloud_detail { "detail" } else { "agg" },
     );
 
     let pending_str = if pending > 0 {
@@ -1432,8 +1526,8 @@ fn render_ip_view(
         String::new()
     };
 
-    let sort_str = if has_bytes {
-        format!(" [sort:{}]", sort_by.label())
+    let sort_str = if dc.has_bytes {
+        format!(" [sort:{}]", dc.sort_by.label())
     } else {
         String::new()
     };
@@ -1446,7 +1540,7 @@ fn render_ip_view(
             total_lines,
             pending_str,
             toggles,
-            group_by.label(),
+            dc.group_by.label(),
             sort_str,
             search_str
         )))
@@ -1463,28 +1557,28 @@ fn render_grouped_view<F>(
     pending: usize,
     filter_desc: &str,
     group_label: &str,
-    group_by: GroupBy,
-    cloud_detail: bool,
     search_str: &str,
-    has_bytes: bool,
-    sort_by: SortBy,
+    dc: &DisplayConfig,
     key_fn: F,
 ) where
     F: Fn(&IpRecord) -> String,
 {
     let mut groups = aggregate_by_field(recs, key_fn);
-    match sort_by {
+    match dc.sort_by {
         SortBy::Hits => groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
         SortBy::Bandwidth => groups.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0))),
     }
 
     let mut header_cells = vec![Cell::from("Count"), Cell::from("%"), Cell::from("IPs")];
-    if has_bytes {
+    if dc.has_bytes {
         header_cells.push(Cell::from("Bandwidth"));
+        header_cells.push(Cell::from("BW%"));
     }
     header_cells.push(Cell::from(group_label));
 
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
+
+    let total_bytes: u64 = groups.iter().map(|(_, _, _, bytes)| bytes).sum();
 
     let rows: Vec<Row> = groups
         .iter()
@@ -1499,8 +1593,14 @@ fn render_grouped_view<F>(
                 Cell::from(format!("{:.2}", pct)),
                 Cell::from(format!("{}", ip_count)),
             ];
-            if has_bytes {
+            if dc.has_bytes {
                 cells.push(Cell::from(format_bytes(*bytes)));
+                let bw_pct = if total_bytes > 0 {
+                    (*bytes as f64 / total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                cells.push(Cell::from(format!("{:.2}", bw_pct)));
             }
             cells.push(Cell::from(key.clone()));
             Row::new(cells)
@@ -1512,8 +1612,9 @@ fn render_grouped_view<F>(
         Constraint::Length(6),
         Constraint::Length(6),
     ];
-    if has_bytes {
+    if dc.has_bytes {
         widths.push(Constraint::Length(10));
+        widths.push(Constraint::Length(6));
     }
     widths.push(Constraint::Min(40));
 
@@ -1523,10 +1624,10 @@ fn render_grouped_view<F>(
         String::new()
     };
 
-    let cloud_str = format!(" [c:{}]", if cloud_detail { "detail" } else { "agg" });
+    let cloud_str = format!(" [c:{}]", if dc.cloud_detail { "detail" } else { "agg" });
 
-    let sort_str = if has_bytes {
-        format!(" [sort:{}]", sort_by.label())
+    let sort_str = if dc.has_bytes {
+        format!(" [sort:{}]", dc.sort_by.label())
     } else {
         String::new()
     };
@@ -1540,7 +1641,7 @@ fn render_grouped_view<F>(
             total_lines,
             pending_str,
             cloud_str,
-            group_by.label(),
+            dc.group_by.label(),
             sort_str,
             search_str
         )))
@@ -1557,11 +1658,8 @@ fn render_ua_global_view(
     total_lines: u64,
     pending: usize,
     filter_desc: &str,
-    group_by: GroupBy,
-    _cloud_detail: bool,
     search_str: &str,
-    has_bytes: bool,
-    sort_by: SortBy,
+    dc: &DisplayConfig,
 ) {
     // Convert global UA counts to sorted vec
     let mut ua_groups: Vec<(String, u64, u64)> = global_ua_counts
@@ -1571,18 +1669,21 @@ fn render_ua_global_view(
             (ua.clone(), *count, bytes)
         })
         .collect();
-    match sort_by {
+    match dc.sort_by {
         SortBy::Hits => ua_groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
         SortBy::Bandwidth => ua_groups.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0))),
     }
 
     let mut header_cells = vec![Cell::from("Count"), Cell::from("%")];
-    if has_bytes {
+    if dc.has_bytes {
         header_cells.push(Cell::from("Bandwidth"));
+        header_cells.push(Cell::from("BW%"));
     }
     header_cells.push(Cell::from("User Agent"));
 
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
+
+    let total_bytes: u64 = ua_groups.iter().map(|(_, _, bytes)| bytes).sum();
 
     let rows: Vec<Row> = ua_groups
         .iter()
@@ -1596,8 +1697,14 @@ fn render_ua_global_view(
                 Cell::from(format!("{}", count)),
                 Cell::from(format!("{:.2}", pct)),
             ];
-            if has_bytes {
+            if dc.has_bytes {
                 cells.push(Cell::from(format_bytes(*bytes)));
+                let bw_pct = if total_bytes > 0 {
+                    (*bytes as f64 / total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                cells.push(Cell::from(format!("{:.2}", bw_pct)));
             }
             cells.push(Cell::from(ua.clone()));
             Row::new(cells)
@@ -1605,8 +1712,9 @@ fn render_ua_global_view(
         .collect();
 
     let mut widths = vec![Constraint::Length(10), Constraint::Length(6)];
-    if has_bytes {
+    if dc.has_bytes {
         widths.push(Constraint::Length(10));
+        widths.push(Constraint::Length(6));
     }
     widths.push(Constraint::Min(40));
 
@@ -1616,8 +1724,8 @@ fn render_ua_global_view(
         String::new()
     };
 
-    let sort_str = if has_bytes {
-        format!(" [sort:{}]", sort_by.label())
+    let sort_str = if dc.has_bytes {
+        format!(" [sort:{}]", dc.sort_by.label())
     } else {
         String::new()
     };
@@ -1629,7 +1737,7 @@ fn render_ua_global_view(
             filter_desc,
             total_lines,
             pending_str,
-            group_by.label(),
+            dc.group_by.label(),
             sort_str,
             search_str
         )))
@@ -3232,7 +3340,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, None, None, None, None, None).unwrap();
+            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 6);
         assert_eq!(ip_counts.len(), 5); // 5 unique IPs
@@ -3270,12 +3378,8 @@ mod tests {
             &path,
             None,
             None,
-            Some(","),
-            Some(1), // IP in field 1
-            Some(4), // UA in field 4
             None,
-            None,
-            None,
+            &DelimiterParser::new(",", Some(1), Some(4), None),
         )
         .unwrap();
 
@@ -3300,8 +3404,14 @@ mod tests {
         drop(file);
 
         // Filter only GET requests
-        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, Some("GET"), None, None, None, None, None, None, None).unwrap();
+        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_file(
+            &path,
+            Some("GET"),
+            None,
+            None,
+            &GenericParser::new().unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(total_lines, 2); // Only GET requests
         assert_eq!(ip_counts.len(), 2);
@@ -3329,11 +3439,7 @@ mod tests {
             None,
             Some("curl"),
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &GenericParser::new().unwrap(),
         )
         .unwrap();
 
@@ -3372,12 +3478,8 @@ mod tests {
             &path,
             None,
             None,
-            Some(";"),
-            Some(1),
-            Some(4),
             None,
-            Some(3), // bytes in field 3
-            None,
+            &DelimiterParser::new(";", Some(1), Some(4), Some(3)),
         )
         .unwrap();
 
@@ -3406,18 +3508,8 @@ mod tests {
         writeln!(file, r#"10.0.0.1 - - [10/Oct/2023:13:55:38 +0000] "GET /style.css HTTP/1.1" 304 0 "http://example.com/index.html" "Mozilla/5.0 (Linux)""#).unwrap();
         drop(file);
 
-        let (ip_counts, total_lines, global_ua_counts, global_ua_bytes) = parse_file(
-            &path,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("nginx"),
-        )
-        .unwrap();
+        let (ip_counts, total_lines, global_ua_counts, global_ua_bytes) =
+            parse_file(&path, None, None, None, &NginxParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 2);
@@ -3451,18 +3543,8 @@ mod tests {
         writeln!(file, r#"2001:db8::1 - - [10/Oct/2023:13:55:36 +0000] "GET / HTTP/1.1" 200 1024 "-" "curl/8.0""#).unwrap();
         drop(file);
 
-        let (ip_counts, total_lines, _, _) = parse_file(
-            &path,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("nginx"),
-        )
-        .unwrap();
+        let (ip_counts, total_lines, _, _) =
+            parse_file(&path, None, None, None, &NginxParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 1);
         assert_eq!(ip_counts.len(), 1);
@@ -3666,7 +3748,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, None, None, None, None, None).unwrap();
+            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 3);
@@ -3695,7 +3777,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, None, None, None, None, None).unwrap();
+            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 4);
         assert_eq!(ip_counts.len(), 4);
@@ -3718,7 +3800,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, None, None, None, None, None).unwrap();
+            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 3);
