@@ -8,9 +8,10 @@ use crossterm::{
 use ipnetwork::IpNetwork;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Constraint,
+    layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
     Terminal,
 };
 use regex::Regex;
@@ -677,7 +678,7 @@ fn main() -> Result<()> {
         parser.as_ref(),
     )?;
     let total_ips = ip_counts.len();
-    let filtered = apply_filters(ip_counts, args.top.as_deref(), args.min, sort_by);
+    let filtered = apply_filters(&ip_counts, args.top.as_deref(), args.min, sort_by);
     let filter_desc = if let Some(ref top) = args.top {
         format!("top {} of {}", top, total_ips)
     } else if let Some(min) = args.min {
@@ -795,6 +796,9 @@ fn main() -> Result<()> {
         global_ua_counts,
         global_ua_bytes,
         dc,
+        ip_counts,
+        args.top,
+        args.min,
     ))?;
 
     Ok(())
@@ -921,14 +925,14 @@ fn parse_file(
 }
 
 fn apply_filters(
-    counts: HashMap<String, (u64, bool, Option<String>, u64)>,
+    counts: &HashMap<String, (u64, bool, Option<String>, u64)>,
     top: Option<&str>,
     min: Option<u64>,
     sort_by: SortBy,
 ) -> Vec<(String, u64, bool, Option<String>, u64)> {
     let mut sorted: Vec<_> = counts
-        .into_iter()
-        .map(|(ip, (c, v6, ua, bytes))| (ip, c, v6, ua, bytes))
+        .iter()
+        .map(|(ip, (c, v6, ua, bytes))| (ip.clone(), *c, *v6, ua.clone(), *bytes))
         .collect();
     match sort_by {
         SortBy::Hits => sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
@@ -962,6 +966,9 @@ async fn run_lookups_and_display(
     global_ua_counts: HashMap<String, u64>,
     global_ua_bytes: HashMap<String, u64>,
     dc: DisplayConfig,
+    full_ip_counts: HashMap<String, (u64, bool, Option<String>, u64)>,
+    top: Option<String>,
+    min: Option<u64>,
 ) -> Result<()> {
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
@@ -1003,23 +1010,23 @@ async fn run_lookups_and_display(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let db_path = db_path.clone();
 
-    let indices_to_lookup: Vec<(usize, String)> = {
-        let recs = records.lock().unwrap();
-        recs.iter()
-            .enumerate()
-            .filter(|(_, rec)| !rec.looked_up)
-            .map(|(idx, rec)| (idx, rec.ip.clone()))
+    let ips_to_lookup: Vec<String> = {
+        let mut recs = records.lock().unwrap();
+        recs.iter_mut()
+            .filter(|rec| !rec.looked_up)
+            .map(|rec| {
+                rec.lookup_in_progress = true;
+                rec.ip.clone()
+            })
             .collect()
     };
 
     let mut handles = vec![];
-    for (idx, ip) in indices_to_lookup {
+    for ip in ips_to_lookup {
         let sem = semaphore.clone();
         let recs = records.clone();
         let dbp = db_path.clone();
         let cache = cloud_cache.clone();
-
-        recs.lock().unwrap()[idx].lookup_in_progress = true;
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -1028,11 +1035,13 @@ async fn run_lookups_and_display(
 
             {
                 let mut recs = recs.lock().unwrap();
-                recs[idx].reverse_dns = rdns.clone();
-                recs[idx].org = org.clone();
-                recs[idx].asn = asn.clone();
-                recs[idx].looked_up = true;
-                recs[idx].lookup_in_progress = false;
+                if let Some(rec) = recs.iter_mut().find(|r| r.ip == ip) {
+                    rec.reverse_dns = rdns.clone();
+                    rec.org = org.clone();
+                    rec.asn = asn.clone();
+                    rec.looked_up = true;
+                    rec.lookup_in_progress = false;
+                }
             }
 
             if let Ok(conn) = Connection::open(&dbp) {
@@ -1053,6 +1062,13 @@ async fn run_lookups_and_display(
             global_ua_counts,
             global_ua_bytes,
             dc,
+            full_ip_counts,
+            top,
+            min,
+            db_path.clone(),
+            cloud_cache.clone(),
+            concurrency,
+            semaphore.clone(),
         )
         .await?;
     } else {
@@ -1121,6 +1137,113 @@ async fn run_lookups_and_display(
     Ok(())
 }
 
+fn reselect_records(
+    full_ip_counts: &HashMap<String, (u64, bool, Option<String>, u64)>,
+    top: Option<&str>,
+    min: Option<u64>,
+    sort_by: SortBy,
+    records: &Arc<Mutex<Vec<IpRecord>>>,
+    db_path: &PathBuf,
+    cloud_cache: &Option<Arc<CloudRangeCache>>,
+    semaphore: &Arc<Semaphore>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let new_top = apply_filters(full_ip_counts, top, min, sort_by);
+
+    // Build lookup of existing records by IP
+    let old_recs = records.lock().unwrap();
+    let old_map: HashMap<String, IpRecord> = old_recs
+        .iter()
+        .map(|r| (r.ip.clone(), r.clone()))
+        .collect();
+    drop(old_recs);
+
+    // Check SQLite cache for any new IPs
+    let conn = Connection::open(db_path).ok();
+
+    let mut new_records = Vec::with_capacity(new_top.len());
+    let mut ips_to_lookup = Vec::new();
+
+    for (ip, count, is_v6, ua, bytes) in new_top {
+        if let Some(existing) = old_map.get(&ip) {
+            // Reuse existing record, update count/bytes in case
+            let mut rec = existing.clone();
+            rec.count = count;
+            rec.bytes = bytes;
+            if ua.is_some() {
+                rec.user_agent = ua;
+            }
+            new_records.push(rec);
+        } else if let Some(cached) = conn.as_ref().and_then(|c| get_ip_record(c, &ip)) {
+            new_records.push(IpRecord {
+                ip: ip.clone(),
+                count,
+                user_agent: ua.or(cached.2),
+                reverse_dns: cached.3,
+                org: cached.4,
+                asn: cached.5,
+                bytes,
+                looked_up: cached.6,
+                lookup_in_progress: !cached.6,
+            });
+            if !cached.6 {
+                ips_to_lookup.push(ip);
+            }
+        } else {
+            if let Some(c) = conn.as_ref() {
+                insert_ip(c, &ip, is_v6, ua.as_deref()).ok();
+            }
+            new_records.push(IpRecord {
+                ip: ip.clone(),
+                count,
+                user_agent: ua,
+                reverse_dns: None,
+                org: None,
+                asn: None,
+                bytes,
+                looked_up: false,
+                lookup_in_progress: true,
+            });
+            ips_to_lookup.push(ip);
+        }
+    }
+
+    // Replace the records vec
+    *records.lock().unwrap() = new_records;
+
+    // Spawn lookup tasks for new IPs
+    let mut handles = Vec::new();
+    for ip in ips_to_lookup {
+        let sem = semaphore.clone();
+        let recs = records.clone();
+        let dbp = db_path.clone();
+        let cache = cloud_cache.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let (rdns, org, asn) =
+                perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref())).await;
+
+            {
+                let mut recs = recs.lock().unwrap();
+                if let Some(rec) = recs.iter_mut().find(|r| r.ip == ip) {
+                    rec.reverse_dns = rdns.clone();
+                    rec.org = org.clone();
+                    rec.asn = asn.clone();
+                    rec.looked_up = true;
+                    rec.lookup_in_progress = false;
+                }
+            }
+
+            if let Ok(conn) = Connection::open(&dbp) {
+                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref()).ok();
+            }
+        });
+        handles.push(handle);
+    }
+
+    handles
+}
+
 async fn run_tui(
     records: Arc<Mutex<Vec<IpRecord>>>,
     handles: Vec<tokio::task::JoinHandle<()>>,
@@ -1129,6 +1252,13 @@ async fn run_tui(
     global_ua_counts: HashMap<String, u64>,
     global_ua_bytes: HashMap<String, u64>,
     mut dc: DisplayConfig,
+    full_ip_counts: HashMap<String, (u64, bool, Option<String>, u64)>,
+    top: Option<String>,
+    min: Option<u64>,
+    db_path: PathBuf,
+    cloud_cache: Option<Arc<CloudRangeCache>>,
+    concurrency: usize,
+    semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -1140,19 +1270,19 @@ async fn run_tui(
     table_state.select(Some(0));
     let mut search_mode = false;
     let mut search_query = String::new();
+    let mut show_help = false;
 
-    let pending_count = Arc::new(Mutex::new(handles.len()));
-    for h in handles {
-        let pc = pending_count.clone();
-        tokio::spawn(async move {
-            h.await.ok();
-            *pc.lock().unwrap() -= 1;
-        });
-    }
+    let active_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(handles));
+    let _ = concurrency; // semaphore already encodes concurrency
 
     loop {
         let recs = records.lock().unwrap().clone();
-        let pending = *pending_count.lock().unwrap();
+        let pending = {
+            let mut handles = active_handles.lock().unwrap();
+            handles.retain(|h| !h.is_finished());
+            handles.len()
+        };
 
         terminal.draw(|f| {
             let filtered_recs: Vec<IpRecord> = if search_query.is_empty() {
@@ -1258,11 +1388,25 @@ async fn run_tui(
                     &dc,
                 ),
             }
+
+            if show_help {
+                render_help_overlay(f, &dc);
+            }
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    if show_help {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                                show_help = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     if search_mode {
                         match key.code {
                             KeyCode::Esc => {
@@ -1339,6 +1483,9 @@ async fn run_tui(
 
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('?') => {
+                            show_help = true;
+                        }
                         KeyCode::Char('s') | KeyCode::Char('/') => {
                             search_mode = true;
                         }
@@ -1348,6 +1495,17 @@ async fn run_tui(
                         }
                         KeyCode::Char('b') => {
                             dc.sort_by = dc.sort_by.toggle();
+                            let new_handles = reselect_records(
+                                &full_ip_counts,
+                                top.as_deref(),
+                                min,
+                                dc.sort_by,
+                                &records,
+                                &db_path,
+                                &cloud_cache,
+                                &semaphore,
+                            );
+                            active_handles.lock().unwrap().extend(new_handles);
                             table_state.select(Some(0));
                         }
                         KeyCode::Char('r') => dc.show_rdns = !dc.show_rdns,
@@ -1384,6 +1542,70 @@ async fn run_tui(
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
+    let area = f.area();
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let height = 24u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    let key_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default();
+
+    let mut lines = vec![
+        Line::from(Span::styled("  Keybindings", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+
+    let bindings = [
+        ("j / Down", "Move down"),
+        ("k / Up", "Move up"),
+        ("PgDn / PgUp", "Scroll by 20 rows"),
+        ("Home / End", "Jump to first / last row"),
+        ("s / /", "Enter search mode"),
+        ("b", "Toggle sort (hits / bandwidth)"),
+        ("g", "Cycle group by (IP / Org / ASN / UA)"),
+        ("r", "Toggle reverse DNS column"),
+        ("u", "Toggle user agent column"),
+        ("o", "Toggle org column"),
+        ("c", "Toggle cloud detail / aggregate"),
+        ("?", "Show / dismiss this help"),
+        ("q / Esc", "Quit"),
+    ];
+
+    for (key, desc) in bindings {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<14}", key), key_style),
+            Span::styled(desc, desc_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    if dc.has_bytes {
+        lines.push(Line::from(Span::styled(
+            "  Sort toggle (b) re-selects top N from full dataset.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press ? or Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Help ")
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    f.render_widget(Clear, popup);
+    f.render_widget(paragraph, popup);
 }
 
 fn aggregate_by_field<F>(recs: &[IpRecord], key_fn: F) -> Vec<(String, u64, usize, u64)>
@@ -1531,7 +1753,7 @@ fn render_ip_view(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs, {} lines{} [{}] [by:{}]{}{} (g/b/r/u/o/c/s, q=quit) ",
+            " {} IPs, {} lines{} [{}] [by:{}]{}{} (g/b/r/u/o/c/s/?=help, q=quit) ",
             filter_desc,
             total_lines,
             pending_str,
@@ -1631,7 +1853,7 @@ fn render_grouped_view<F>(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs by {}, {} lines{}{} [by:{}]{}{} (g/b/c/s, q=quit) ",
+            " {} IPs by {}, {} lines{}{} [by:{}]{}{} (g/b/c/s/?=help, q=quit) ",
             filter_desc,
             group_label,
             total_lines,
@@ -1729,7 +1951,7 @@ fn render_ua_global_view(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs by User Agent, {} lines{} [by:{}]{}{} (g/b/s, q=quit) ",
+            " {} IPs by User Agent, {} lines{} [by:{}]{}{} (g/b/s/?=help, q=quit) ",
             filter_desc,
             total_lines,
             pending_str,
@@ -3634,7 +3856,7 @@ mod tests {
             (10u64, false, Some("UA4".to_string()), 0u64),
         );
 
-        let filtered = apply_filters(counts, Some("2"), None, SortBy::Hits);
+        let filtered = apply_filters(&counts, Some("2"), None, SortBy::Hits);
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].0, "192.168.1.1");
         assert_eq!(filtered[0].1, 100);
@@ -3662,7 +3884,7 @@ mod tests {
             (10u64, false, Some("UA4".to_string()), 0u64),
         );
 
-        let filtered = apply_filters(counts, Some("50%"), None, SortBy::Hits);
+        let filtered = apply_filters(&counts, Some("50%"), None, SortBy::Hits);
         assert_eq!(filtered.len(), 2); // 50% of 4 = 2
     }
 
@@ -3686,7 +3908,7 @@ mod tests {
             (10u64, false, Some("UA4".to_string()), 0u64),
         );
 
-        let filtered = apply_filters(counts, None, Some(30), SortBy::Hits);
+        let filtered = apply_filters(&counts, None, Some(30), SortBy::Hits);
         assert_eq!(filtered.len(), 2); // Only >= 30
         assert_eq!(filtered[0].1, 100);
         assert_eq!(filtered[1].1, 50);
