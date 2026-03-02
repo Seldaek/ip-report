@@ -116,8 +116,8 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
-fn extract_ua_base(ua: &str) -> String {
-    ua.split('/').next().unwrap_or(ua).to_string()
+fn extract_ua_base(ua: &str) -> &str {
+    ua.split('/').next().unwrap_or(ua)
 }
 
 const CLOUD_PROVIDER_PREFIXES: &[&str] = &["AWS", "Azure", "GCP", "DigitalOcean", "Cloudflare"];
@@ -214,14 +214,55 @@ impl DelimiterParser {
 
 impl LogParser for DelimiterParser {
     fn parse_line(&self, line: &str) -> Option<ParsedLine> {
+        // Fast path: when field indices are specified, iterate once without collecting
+        if self.ip_field.is_some() {
+            let ip_idx = self.ip_field.unwrap().saturating_sub(1);
+            let ua_idx = self.ua_field.map(|i| i.saturating_sub(1));
+            let bytes_idx = self.bytes_field.map(|i| i.saturating_sub(1));
+            let max_idx = [Some(ip_idx), ua_idx, bytes_idx]
+                .iter()
+                .filter_map(|i| *i)
+                .max()
+                .unwrap_or(0);
+
+            let mut ip_str = None;
+            let mut ua_raw = None;
+            let mut bytes_raw = None;
+
+            for (i, field) in line.split(&self.delimiter).enumerate() {
+                if i == ip_idx {
+                    ip_str = Some(field);
+                }
+                if ua_idx == Some(i) {
+                    ua_raw = Some(field);
+                }
+                if bytes_idx == Some(i) {
+                    bytes_raw = Some(field);
+                }
+                if i >= max_idx {
+                    break;
+                }
+            }
+
+            let ip: IpAddr = ip_str?.parse().ok()?;
+            let ua = ua_raw
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let bytes: u64 = bytes_raw
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+
+            return Some(ParsedLine {
+                ip,
+                user_agent: ua,
+                bytes,
+            });
+        }
+
+        // Slow path: auto-detect fields (requires collecting)
         let fields: Vec<&str> = line.split(&self.delimiter).collect();
 
-        let ip_str = if let Some(idx) = self.ip_field {
-            fields.get(idx.saturating_sub(1)).copied()
-        } else {
-            fields.iter().find(|f| f.parse::<IpAddr>().is_ok()).copied()
-        };
-
+        let ip_str = fields.iter().find(|f| f.parse::<IpAddr>().is_ok()).copied();
         let ip: IpAddr = ip_str?.parse().ok()?;
 
         let ua = if let Some(idx) = self.ua_field {
@@ -829,8 +870,7 @@ fn parse_file(
         .transpose()
         .context("Invalid --ua-filter regex")?;
 
-    // Track (count, is_v6, ua_counts, bytes)
-    let mut counts: HashMap<String, (u64, bool, HashMap<String, u64>, u64)> = HashMap::new();
+    let mut counts: HashMap<IpAddr, (u64, HashMap<String, u64>, u64)> = HashMap::new();
     let mut global_ua_counts: HashMap<String, u64> = HashMap::new();
     let mut global_ua_bytes: HashMap<String, u64> = HashMap::new();
     let mut total_lines: u64 = 0;
@@ -888,18 +928,21 @@ fn parse_file(
             }
         }
 
-        let key = parsed.ip.to_string();
-        let is_v6 = parsed.ip.is_ipv6();
-        let entry = counts.entry(key).or_insert((0, is_v6, HashMap::new(), 0));
+        let entry = counts.entry(parsed.ip).or_insert((0, HashMap::new(), 0));
         entry.0 += 1;
-        entry.3 += parsed.bytes;
+        entry.2 += parsed.bytes;
         if let Some(ref ua_str) = parsed.user_agent {
             if !ua_str.is_empty() {
-                *entry.2.entry(ua_str.clone()).or_insert(0) += 1;
+                *entry.1.entry(ua_str.clone()).or_insert(0) += 1;
                 let ua_base = extract_ua_base(ua_str);
                 if !ua_base.is_empty() {
-                    *global_ua_counts.entry(ua_base.clone()).or_insert(0) += 1;
-                    *global_ua_bytes.entry(ua_base).or_insert(0) += parsed.bytes;
+                    if let Some(c) = global_ua_counts.get_mut(ua_base) {
+                        *c += 1;
+                        *global_ua_bytes.get_mut(ua_base).unwrap() += parsed.bytes;
+                    } else {
+                        global_ua_counts.insert(ua_base.to_string(), 1);
+                        global_ua_bytes.insert(ua_base.to_string(), parsed.bytes);
+                    }
                 }
             }
         }
@@ -909,15 +952,16 @@ fn parse_file(
         eprintln!("\rReading: done ({} lines)        ", total_lines);
     }
 
-    // Convert to final format with most common UA
+    // Convert IpAddr keys to String and pick most common UA
     let result: HashMap<String, (u64, bool, Option<String>, u64)> = counts
         .into_iter()
-        .map(|(ip, (count, is_v6, ua_counts, bytes))| {
+        .map(|(ip, (count, ua_counts, bytes))| {
+            let is_v6 = ip.is_ipv6();
             let top_ua = ua_counts
                 .into_iter()
                 .max_by_key(|(_, c)| *c)
                 .map(|(ua, _)| ua);
-            (ip, (count, is_v6, top_ua, bytes))
+            (ip.to_string(), (count, is_v6, top_ua, bytes))
         })
         .collect();
 
