@@ -336,7 +336,7 @@ impl LogParser for GenericParser {
 struct Args {
     /// Input file to parse
     file: PathBuf,
-    /// Show only top N IPs, or top N% (e.g., "10" or "10%") [default: 100]
+    /// Show only top N IPs, or top N% (e.g., "10" or "10%") [default: 10000]
     #[arg(long)]
     top: Option<String>,
     /// Only show IPs with at least N hits
@@ -605,7 +605,7 @@ fn main() -> Result<()> {
 
     // Default to top 100 when neither --top nor --min is specified
     if args.top.is_none() && args.min.is_none() {
-        args.top = Some("100".to_string());
+        args.top = Some("10000".to_string());
     }
 
     // Apply format presets (only fill in fields the user didn't explicitly set)
@@ -1486,14 +1486,14 @@ async fn run_tui(
                         KeyCode::Char('?') => {
                             show_help = true;
                         }
-                        KeyCode::Char('s') | KeyCode::Char('/') => {
+                        KeyCode::Char('f') | KeyCode::F(3) => {
                             search_mode = true;
                         }
                         KeyCode::Char('g') => {
                             dc.group_by = dc.group_by.next();
                             table_state.select(Some(0));
                         }
-                        KeyCode::Char('b') => {
+                        KeyCode::Char('s') => {
                             dc.sort_by = dc.sort_by.toggle();
                             let new_handles = reselect_records(
                                 &full_ip_counts,
@@ -1565,8 +1565,8 @@ fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
         ("k / Up", "Move up"),
         ("PgDn / PgUp", "Scroll by 20 rows"),
         ("Home / End", "Jump to first / last row"),
-        ("s / /", "Enter search mode"),
-        ("b", "Toggle sort (hits / bandwidth)"),
+        ("f / F3", "Search / filter"),
+        ("s", "Toggle sort (hits / bandwidth)"),
         ("g", "Cycle group by (IP / Org / ASN / UA)"),
         ("r", "Toggle reverse DNS column"),
         ("u", "Toggle user agent column"),
@@ -1587,7 +1587,7 @@ fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
     lines.push(Line::from(""));
     if dc.has_bytes {
         lines.push(Line::from(Span::styled(
-            "  Sort toggle (b) re-selects top N from full dataset.",
+            "  Sort toggle (s) re-selects top N from full dataset.",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1753,7 +1753,7 @@ fn render_ip_view(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs, {} lines{} [{}] [by:{}]{}{} (g/b/r/u/o/c/s/?=help, q=quit) ",
+            " {} IPs, {} lines{} [{}] [by:{}]{}{} (g/s/r/u/o/c/f/?=help, q=quit)",
             filter_desc,
             total_lines,
             pending_str,
@@ -1853,7 +1853,7 @@ fn render_grouped_view<F>(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs by {}, {} lines{}{} [by:{}]{}{} (g/b/c/s/?=help, q=quit) ",
+            " {} IPs by {}, {} lines{}{} [by:{}]{}{} (g/s/c/f/?=help, q=quit)",
             filter_desc,
             group_label,
             total_lines,
@@ -1951,7 +1951,7 @@ fn render_ua_global_view(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs by User Agent, {} lines{} [by:{}]{}{} (g/b/s/?=help, q=quit) ",
+            " {} IPs by User Agent, {} lines{} [by:{}]{}{} (g/s/f/?=help, q=quit)",
             filter_desc,
             total_lines,
             pending_str,
