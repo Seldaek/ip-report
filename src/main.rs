@@ -85,6 +85,8 @@ struct DisplayConfig {
     show_ua: bool,
     show_org: bool,
     cloud_detail: bool,
+    show_country: bool,
+    show_domain: bool,
     group_by: GroupBy,
 }
 
@@ -434,6 +436,12 @@ struct Args {
     /// Sort order for --top truncation and display (hits or bandwidth) [default: hits]
     #[arg(long)]
     sort: Option<String>,
+    /// ipinfo.io API token for org/ASN lookups (replaces whois when set)
+    #[arg(long)]
+    ipinfo_token: Option<String>,
+    /// Minimum request count for an IP to qualify for ipinfo lookup [default: 10]
+    #[arg(long, default_value = "10")]
+    ipinfo_min_requests: u64,
 }
 
 #[derive(Clone)]
@@ -444,9 +452,13 @@ struct IpRecord {
     reverse_dns: Option<String>,
     org: Option<String>,
     asn: Option<String>,
+    infra: Option<String>,
+    country: Option<String>,
+    company_domain: Option<String>,
     bytes: u64,
     looked_up: bool,
     lookup_in_progress: bool,
+    in_display_set: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -579,6 +591,80 @@ impl CloudRangeCache {
         }
 
         None
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct IpInfoAsn {
+    asn: Option<String>,
+    name: Option<String>,
+    domain: Option<String>,
+    route: Option<String>,
+    #[serde(rename = "type")]
+    asn_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpInfoCompany {
+    name: Option<String>,
+    domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpInfoResponse {
+    hostname: Option<String>,
+    country: Option<String>,
+    org: Option<String>,
+    asn: Option<IpInfoAsn>,
+    company: Option<IpInfoCompany>,
+}
+
+async fn fetch_ipinfo(ip: &str, token: &str) -> Option<IpInfoResponse> {
+    let url = format!("https://ipinfo.io/{}?token={}", ip, token);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<IpInfoResponse>().await.ok()
+}
+
+fn parse_ipinfo_org(org: &str) -> (Option<String>, Option<String>) {
+    let trimmed = org.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    // Format: "AS15169 Google LLC"
+    if let Some(rest) = trimmed.strip_prefix("AS") {
+        if let Some(space_idx) = rest.find(' ') {
+            if rest[..space_idx].chars().all(|c| c.is_ascii_digit()) {
+                let asn = format!("AS{}", &rest[..space_idx]);
+                let org_name = rest[space_idx..].trim();
+                if org_name.is_empty() {
+                    return (Some(asn), None);
+                }
+                return (Some(asn), Some(org_name.to_string()));
+            }
+        }
+        // "AS15169" with no org name
+        if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+            return (Some(format!("AS{}", rest)), None);
+        }
+    }
+    // No ASN prefix, treat entire string as org
+    (None, Some(trimmed.to_string()))
+}
+
+fn display_org_with_infra(org: Option<&str>, infra: Option<&str>, cloud_detail: bool) -> String {
+    let infra_display = infra.map(|i| effective_org(i, cloud_detail));
+    match (org, &infra_display) {
+        (Some(o), Some(i)) => format!("{} ({})", o, i),
+        (Some(o), None) => o.to_string(),
+        (None, Some(i)) => format!("({})", i),
+        (None, None) => "-".to_string(),
     }
 }
 
@@ -742,6 +828,8 @@ fn main() -> Result<()> {
         show_ua: true,
         show_org: true,
         cloud_detail: true,
+        show_country: true,
+        show_domain: true,
         group_by: GroupBy::Ip,
     };
 
@@ -840,6 +928,8 @@ fn main() -> Result<()> {
         ip_counts,
         args.top,
         args.min,
+        args.ipinfo_token,
+        args.ipinfo_min_requests,
     ))?;
 
     Ok(())
@@ -1004,7 +1094,7 @@ fn apply_filters(
 }
 
 async fn run_lookups_and_display(
-    ips: Vec<(String, u64, bool, Option<String>, u64)>,
+    display_ips: Vec<(String, u64, bool, Option<String>, u64)>,
     db_path: &PathBuf,
     concurrency: usize,
     total_lines: u64,
@@ -1016,13 +1106,40 @@ async fn run_lookups_and_display(
     full_ip_counts: HashMap<String, (u64, bool, Option<String>, u64)>,
     top: Option<String>,
     min: Option<u64>,
+    ipinfo_token: Option<String>,
+    ipinfo_min_requests: u64,
 ) -> Result<()> {
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
 
-    let records: Vec<IpRecord> = ips
+    // Build the set of display IPs for fast membership check
+    // When ipinfo token is available, expand to all IPs with count >= min_requests
+    let all_ips: Vec<(String, u64, bool, Option<String>, u64, bool)> = if ipinfo_token.is_some() {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        // First add all display IPs (marked as in_display_set)
+        for (ip, count, is_v6, ua, bytes) in &display_ips {
+            seen.insert(ip.clone());
+            result.push((ip.clone(), *count, *is_v6, ua.clone(), *bytes, true));
+        }
+        // Then add non-display IPs that meet the threshold
+        for (ip, (count, is_v6, ua, bytes)) in &full_ip_counts {
+            if !seen.contains(ip) && *count >= ipinfo_min_requests {
+                seen.insert(ip.clone());
+                result.push((ip.clone(), *count, *is_v6, ua.clone(), *bytes, false));
+            }
+        }
+        result
+    } else {
+        display_ips
+            .into_iter()
+            .map(|(ip, count, is_v6, ua, bytes)| (ip, count, is_v6, ua, bytes, true))
+            .collect()
+    };
+
+    let records: Vec<IpRecord> = all_ips
         .iter()
-        .map(|(ip, count, is_v6, ua, bytes)| {
+        .map(|(ip, count, is_v6, ua, bytes, in_display)| {
             let existing = get_ip_record(&conn, ip);
             if let Some(rec) = existing {
                 IpRecord {
@@ -1032,9 +1149,13 @@ async fn run_lookups_and_display(
                     reverse_dns: rec.3,
                     org: rec.4,
                     asn: rec.5,
+                    infra: rec.7,
+                    country: rec.8,
+                    company_domain: rec.9,
                     bytes: *bytes,
                     looked_up: rec.6,
                     lookup_in_progress: false,
+                    in_display_set: *in_display,
                 }
             } else {
                 insert_ip(&conn, ip, *is_v6, ua.as_deref()).ok();
@@ -1045,9 +1166,13 @@ async fn run_lookups_and_display(
                     reverse_dns: None,
                     org: None,
                     asn: None,
+                    infra: None,
+                    country: None,
+                    company_domain: None,
                     bytes: *bytes,
                     looked_up: false,
                     lookup_in_progress: false,
+                    in_display_set: *in_display,
                 }
             }
         })
@@ -1057,28 +1182,29 @@ async fn run_lookups_and_display(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let db_path = db_path.clone();
 
-    let ips_to_lookup: Vec<String> = {
+    let ips_to_lookup: Vec<(String, u64)> = {
         let mut recs = records.lock().unwrap();
         recs.iter_mut()
             .filter(|rec| !rec.looked_up)
             .map(|rec| {
                 rec.lookup_in_progress = true;
-                rec.ip.clone()
+                (rec.ip.clone(), rec.count)
             })
             .collect()
     };
 
     let mut handles = vec![];
-    for ip in ips_to_lookup {
+    for (ip, count) in ips_to_lookup {
         let sem = semaphore.clone();
         let recs = records.clone();
         let dbp = db_path.clone();
         let cache = cloud_cache.clone();
+        let token = ipinfo_token.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let (rdns, org, asn) =
-                perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref())).await;
+            let (rdns, org, asn, infra, country, company_domain, asn_obj) =
+                perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref()), token.as_deref(), count, ipinfo_min_requests).await;
 
             {
                 let mut recs = recs.lock().unwrap();
@@ -1086,13 +1212,21 @@ async fn run_lookups_and_display(
                     rec.reverse_dns = rdns.clone();
                     rec.org = org.clone();
                     rec.asn = asn.clone();
+                    rec.infra = infra.clone();
+                    rec.country = country.clone();
+                    rec.company_domain = company_domain.clone();
                     rec.looked_up = true;
                     rec.lookup_in_progress = false;
                 }
             }
 
             if let Ok(conn) = Connection::open(&dbp) {
-                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref()).ok();
+                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                if let Some(ref asn_detail) = asn_obj {
+                    if let Some(ref asn_id) = asn_detail.asn {
+                        store_asn(&conn, asn_id, asn_detail.name.as_deref(), asn_detail.domain.as_deref(), asn_detail.route.as_deref(), asn_detail.asn_type.as_deref()).ok();
+                    }
+                }
             }
         });
         handles.push(handle);
@@ -1116,6 +1250,8 @@ async fn run_lookups_and_display(
             cloud_cache.clone(),
             concurrency,
             semaphore.clone(),
+            ipinfo_token.clone(),
+            ipinfo_min_requests,
         )
         .await?;
     } else {
@@ -1125,13 +1261,13 @@ async fn run_lookups_and_display(
         let recs = records.lock().unwrap();
         println!("Total lines: {}\n", total_lines);
         if dc.has_bytes {
-            let total_bytes: u64 = recs.iter().map(|rec| rec.bytes).sum();
+            let total_bytes: u64 = recs.iter().filter(|r| r.in_display_set).map(|rec| rec.bytes).sum();
             println!(
-                "{:<8} {:<6} {:<10} {:<6} {:<40} {:<40} {:<30} {:<12} {}",
-                "Count", "%", "Bandwidth", "BW%", "IP", "Reverse DNS", "Org", "ASN", "User Agent"
+                "{:<8} {:<6} {:<10} {:<6} {:<40} {:<40} {:<30} {:<12} {:<4} {:<22} {}",
+                "Count", "%", "Bandwidth", "BW%", "IP", "Reverse DNS", "Org", "ASN", "CC", "Domain", "User Agent"
             );
-            println!("{}", "-".repeat(201));
-            for rec in recs.iter() {
+            println!("{}", "-".repeat(227));
+            for rec in recs.iter().filter(|r| r.in_display_set) {
                 let pct = if total_lines > 0 {
                     (rec.count as f64 / total_lines as f64) * 100.0
                 } else {
@@ -1142,39 +1278,45 @@ async fn run_lookups_and_display(
                 } else {
                     0.0
                 };
+                let org_display = display_org_with_infra(rec.org.as_deref(), rec.infra.as_deref(), dc.cloud_detail);
                 println!(
-                    "{:<8} {:<6.2} {:<10} {:<6.2} {:<40} {:<40} {:<30} {:<12} {}",
+                    "{:<8} {:<6.2} {:<10} {:<6.2} {:<40} {:<40} {:<30} {:<12} {:<4} {:<22} {}",
                     rec.count,
                     pct,
                     format_bytes(rec.bytes),
                     bw_pct,
                     rec.ip,
                     truncate_str(rec.reverse_dns.as_deref().unwrap_or("-"), 38),
-                    truncate_str(rec.org.as_deref().unwrap_or("-"), 28),
+                    truncate_str(&org_display, 28),
                     rec.asn.as_deref().unwrap_or("-"),
+                    rec.country.as_deref().unwrap_or("-"),
+                    truncate_str(rec.company_domain.as_deref().unwrap_or("-"), 20),
                     truncate_str(rec.user_agent.as_deref().unwrap_or("-"), 50)
                 );
             }
         } else {
             println!(
-                "{:<8} {:<6} {:<40} {:<40} {:<30} {:<12} {}",
-                "Count", "%", "IP", "Reverse DNS", "Org", "ASN", "User Agent"
+                "{:<8} {:<6} {:<40} {:<40} {:<30} {:<12} {:<4} {:<22} {}",
+                "Count", "%", "IP", "Reverse DNS", "Org", "ASN", "CC", "Domain", "User Agent"
             );
-            println!("{}", "-".repeat(185));
-            for rec in recs.iter() {
+            println!("{}", "-".repeat(211));
+            for rec in recs.iter().filter(|r| r.in_display_set) {
                 let pct = if total_lines > 0 {
                     (rec.count as f64 / total_lines as f64) * 100.0
                 } else {
                     0.0
                 };
+                let org_display = display_org_with_infra(rec.org.as_deref(), rec.infra.as_deref(), dc.cloud_detail);
                 println!(
-                    "{:<8} {:<6.2} {:<40} {:<40} {:<30} {:<12} {}",
+                    "{:<8} {:<6.2} {:<40} {:<40} {:<30} {:<12} {:<4} {:<22} {}",
                     rec.count,
                     pct,
                     rec.ip,
                     truncate_str(rec.reverse_dns.as_deref().unwrap_or("-"), 38),
-                    truncate_str(rec.org.as_deref().unwrap_or("-"), 28),
+                    truncate_str(&org_display, 28),
                     rec.asn.as_deref().unwrap_or("-"),
+                    rec.country.as_deref().unwrap_or("-"),
+                    truncate_str(rec.company_domain.as_deref().unwrap_or("-"), 20),
                     truncate_str(rec.user_agent.as_deref().unwrap_or("-"), 50)
                 );
             }
@@ -1193,8 +1335,32 @@ fn reselect_records(
     db_path: &PathBuf,
     cloud_cache: &Option<Arc<CloudRangeCache>>,
     semaphore: &Arc<Semaphore>,
+    ipinfo_token: &Option<String>,
+    ipinfo_min_requests: u64,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let new_top = apply_filters(full_ip_counts, top, min, sort_by);
+
+    // When ipinfo token is available, expand to all IPs with count >= min_requests
+    let all_ips: Vec<(String, u64, bool, Option<String>, u64, bool)> = if ipinfo_token.is_some() {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for (ip, count, is_v6, ua, bytes) in &new_top {
+            seen.insert(ip.clone());
+            result.push((ip.clone(), *count, *is_v6, ua.clone(), *bytes, true));
+        }
+        for (ip, (count, is_v6, ua, bytes)) in full_ip_counts {
+            if !seen.contains(ip) && *count >= ipinfo_min_requests {
+                seen.insert(ip.clone());
+                result.push((ip.clone(), *count, *is_v6, ua.clone(), *bytes, false));
+            }
+        }
+        result
+    } else {
+        new_top
+            .into_iter()
+            .map(|(ip, count, is_v6, ua, bytes)| (ip, count, is_v6, ua, bytes, true))
+            .collect()
+    };
 
     // Build lookup of existing records by IP
     let old_recs = records.lock().unwrap();
@@ -1207,20 +1373,22 @@ fn reselect_records(
     // Check SQLite cache for any new IPs
     let conn = Connection::open(db_path).ok();
 
-    let mut new_records = Vec::with_capacity(new_top.len());
+    let mut new_records = Vec::with_capacity(all_ips.len());
     let mut ips_to_lookup = Vec::new();
 
-    for (ip, count, is_v6, ua, bytes) in new_top {
+    for (ip, count, is_v6, ua, bytes, in_display) in all_ips {
         if let Some(existing) = old_map.get(&ip) {
-            // Reuse existing record, update count/bytes in case
+            // Reuse existing record, update count/bytes/display flag
             let mut rec = existing.clone();
             rec.count = count;
             rec.bytes = bytes;
+            rec.in_display_set = in_display;
             if ua.is_some() {
                 rec.user_agent = ua;
             }
             new_records.push(rec);
         } else if let Some(cached) = conn.as_ref().and_then(|c| get_ip_record(c, &ip)) {
+            let needs_lookup = !cached.6;
             new_records.push(IpRecord {
                 ip: ip.clone(),
                 count,
@@ -1228,12 +1396,16 @@ fn reselect_records(
                 reverse_dns: cached.3,
                 org: cached.4,
                 asn: cached.5,
+                infra: cached.7,
+                country: cached.8,
+                company_domain: cached.9,
                 bytes,
                 looked_up: cached.6,
-                lookup_in_progress: !cached.6,
+                lookup_in_progress: needs_lookup,
+                in_display_set: in_display,
             });
-            if !cached.6 {
-                ips_to_lookup.push(ip);
+            if needs_lookup {
+                ips_to_lookup.push((ip, count));
             }
         } else {
             if let Some(c) = conn.as_ref() {
@@ -1246,11 +1418,15 @@ fn reselect_records(
                 reverse_dns: None,
                 org: None,
                 asn: None,
+                infra: None,
+                country: None,
+                company_domain: None,
                 bytes,
                 looked_up: false,
                 lookup_in_progress: true,
+                in_display_set: in_display,
             });
-            ips_to_lookup.push(ip);
+            ips_to_lookup.push((ip, count));
         }
     }
 
@@ -1259,16 +1435,17 @@ fn reselect_records(
 
     // Spawn lookup tasks for new IPs
     let mut handles = Vec::new();
-    for ip in ips_to_lookup {
+    for (ip, count) in ips_to_lookup {
         let sem = semaphore.clone();
         let recs = records.clone();
         let dbp = db_path.clone();
         let cache = cloud_cache.clone();
+        let token = ipinfo_token.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let (rdns, org, asn) =
-                perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref())).await;
+            let (rdns, org, asn, infra, country, company_domain, asn_obj) =
+                perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref()), token.as_deref(), count, ipinfo_min_requests).await;
 
             {
                 let mut recs = recs.lock().unwrap();
@@ -1276,13 +1453,21 @@ fn reselect_records(
                     rec.reverse_dns = rdns.clone();
                     rec.org = org.clone();
                     rec.asn = asn.clone();
+                    rec.infra = infra.clone();
+                    rec.country = country.clone();
+                    rec.company_domain = company_domain.clone();
                     rec.looked_up = true;
                     rec.lookup_in_progress = false;
                 }
             }
 
             if let Ok(conn) = Connection::open(&dbp) {
-                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref()).ok();
+                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                if let Some(ref asn_detail) = asn_obj {
+                    if let Some(ref asn_id) = asn_detail.asn {
+                        store_asn(&conn, asn_id, asn_detail.name.as_deref(), asn_detail.domain.as_deref(), asn_detail.route.as_deref(), asn_detail.asn_type.as_deref()).ok();
+                    }
+                }
             }
         });
         handles.push(handle);
@@ -1306,6 +1491,8 @@ async fn run_tui(
     cloud_cache: Option<Arc<CloudRangeCache>>,
     concurrency: usize,
     semaphore: Arc<Semaphore>,
+    ipinfo_token: Option<String>,
+    ipinfo_min_requests: u64,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -1351,6 +1538,18 @@ async fn run_tui(
                                 .as_ref()
                                 .map(|s| s.to_lowercase().contains(&q))
                                 .unwrap_or(false)
+                            || r.infra
+                                .as_ref()
+                                .map(|s| s.to_lowercase().contains(&q))
+                                .unwrap_or(false)
+                            || r.country
+                                .as_ref()
+                                .map(|s| s.to_lowercase().contains(&q))
+                                .unwrap_or(false)
+                            || r.company_domain
+                                .as_ref()
+                                .map(|s| s.to_lowercase().contains(&q))
+                                .unwrap_or(false)
                             || r.user_agent
                                 .as_ref()
                                 .map(|s| s.to_lowercase().contains(&q))
@@ -1377,16 +1576,22 @@ async fn run_tui(
             };
 
             match dc.group_by {
-                GroupBy::Ip => render_ip_view(
-                    f,
-                    &filtered_recs,
-                    &mut table_state,
-                    total_lines,
-                    pending,
-                    filter_desc,
-                    &search_str,
-                    &dc,
-                ),
+                GroupBy::Ip => {
+                    let display_recs: Vec<IpRecord> = filtered_recs.iter()
+                        .filter(|r| r.in_display_set)
+                        .cloned()
+                        .collect();
+                    render_ip_view(
+                        f,
+                        &display_recs,
+                        &mut table_state,
+                        total_lines,
+                        pending,
+                        filter_desc,
+                        &search_str,
+                        &dc,
+                    );
+                }
                 GroupBy::Org => render_grouped_view(
                     f,
                     &filtered_recs,
@@ -1398,8 +1603,9 @@ async fn run_tui(
                     &search_str,
                     &dc,
                     |r| {
-                        effective_org(
-                            &r.org.clone().unwrap_or_else(|| "-".to_string()),
+                        display_org_with_infra(
+                            r.org.as_deref(),
+                            r.infra.as_deref(),
                             dc.cloud_detail,
                         )
                     },
@@ -1416,8 +1622,9 @@ async fn run_tui(
                     &dc,
                     |r| {
                         r.asn.clone().unwrap_or_else(|| {
-                            effective_org(
-                                &r.org.clone().unwrap_or_else(|| "-".to_string()),
+                            display_org_with_infra(
+                                r.org.as_deref(),
+                                r.infra.as_deref(),
                                 dc.cloud_detail,
                             )
                         })
@@ -1497,6 +1704,18 @@ async fn run_tui(
                                         .as_ref()
                                         .map(|s| s.to_lowercase().contains(&q))
                                         .unwrap_or(false)
+                                    || r.infra
+                                        .as_ref()
+                                        .map(|s| s.to_lowercase().contains(&q))
+                                        .unwrap_or(false)
+                                    || r.country
+                                        .as_ref()
+                                        .map(|s| s.to_lowercase().contains(&q))
+                                        .unwrap_or(false)
+                                    || r.company_domain
+                                        .as_ref()
+                                        .map(|s| s.to_lowercase().contains(&q))
+                                        .unwrap_or(false)
                                     || r.user_agent
                                         .as_ref()
                                         .map(|s| s.to_lowercase().contains(&q))
@@ -1508,18 +1727,20 @@ async fn run_tui(
                     let filtered_owned: Vec<IpRecord> =
                         filtered_recs.iter().map(|r| (*r).clone()).collect();
                     let len = match dc.group_by {
-                        GroupBy::Ip => filtered_recs.len(),
+                        GroupBy::Ip => filtered_recs.iter().filter(|r| r.in_display_set).count(),
                         GroupBy::Org => aggregate_by_field(&filtered_owned, |r| {
-                            effective_org(
-                                &r.org.clone().unwrap_or_else(|| "-".to_string()),
+                            display_org_with_infra(
+                                r.org.as_deref(),
+                                r.infra.as_deref(),
                                 dc.cloud_detail,
                             )
                         })
                         .len(),
                         GroupBy::Asn => aggregate_by_field(&filtered_owned, |r| {
                             r.asn.clone().unwrap_or_else(|| {
-                                effective_org(
-                                    &r.org.clone().unwrap_or_else(|| "-".to_string()),
+                                display_org_with_infra(
+                                    r.org.as_deref(),
+                                    r.infra.as_deref(),
                                     dc.cloud_detail,
                                 )
                             })
@@ -1570,6 +1791,8 @@ async fn run_tui(
                                 &db_path,
                                 &cloud_cache,
                                 &semaphore,
+                                &ipinfo_token,
+                                ipinfo_min_requests,
                             );
                             active_handles.lock().unwrap().extend(new_handles);
                             table_state.select(Some(0));
@@ -1577,6 +1800,8 @@ async fn run_tui(
                         KeyCode::Char('r') => dc.show_rdns = !dc.show_rdns,
                         KeyCode::Char('u') => dc.show_ua = !dc.show_ua,
                         KeyCode::Char('o') => dc.show_org = !dc.show_org,
+                        KeyCode::Char('y') => dc.show_country = !dc.show_country,
+                        KeyCode::Char('d') => dc.show_domain = !dc.show_domain,
                         KeyCode::Char('c') => dc.cloud_detail = !dc.cloud_detail,
                         KeyCode::Down | KeyCode::Char('j') => {
                             let i = table_state.selected().unwrap_or(0);
@@ -1613,7 +1838,7 @@ async fn run_tui(
 fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
     let area = f.area();
     let width = 60u16.min(area.width.saturating_sub(4));
-    let height = 24u16.min(area.height.saturating_sub(4));
+    let height = 26u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -1637,6 +1862,8 @@ fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
         ("r", "Toggle reverse DNS column"),
         ("u", "Toggle user agent column"),
         ("o", "Toggle org column"),
+        ("y", "Toggle country column"),
+        ("d", "Toggle domain column"),
         ("c", "Toggle cloud detail / aggregate"),
         ("?", "Show / dismiss this help"),
         ("q / Esc", "Quit"),
@@ -1716,6 +1943,12 @@ fn render_ip_view(
     if dc.show_org {
         header_cells.push(Cell::from("Org"));
     }
+    if dc.show_country {
+        header_cells.push(Cell::from("CC"));
+    }
+    if dc.show_domain {
+        header_cells.push(Cell::from("Domain"));
+    }
     if dc.show_ua {
         header_cells.push(Cell::from("User Agent"));
     }
@@ -1726,11 +1959,15 @@ fn render_ip_view(
         + dc.show_rdns as usize
         + dc.show_ua as usize
         + dc.show_org as usize
+        + dc.show_country as usize
+        + dc.show_domain as usize
         + dc.has_bytes as usize * 2;
     let extra_width: usize = if visible_cols <= 4 {
         60
-    } else if visible_cols == 5 {
+    } else if visible_cols <= 5 {
         30
+    } else if visible_cols <= 6 {
+        15
     } else {
         0
     };
@@ -1767,8 +2004,17 @@ fn render_ip_view(
                 )));
             }
             if dc.show_org {
-                let org_str = effective_org(rec.org.as_deref().unwrap_or("-"), dc.cloud_detail);
+                let org_str = display_org_with_infra(rec.org.as_deref(), rec.infra.as_deref(), dc.cloud_detail);
                 cells.push(Cell::from(truncate_str(&org_str, 25 + extra_width)));
+            }
+            if dc.show_country {
+                cells.push(Cell::from(rec.country.as_deref().unwrap_or("-").to_string()));
+            }
+            if dc.show_domain {
+                cells.push(Cell::from(truncate_str(
+                    rec.company_domain.as_deref().unwrap_or("-"),
+                    20 + extra_width,
+                )));
             }
             if dc.show_ua {
                 cells.push(Cell::from(truncate_str(
@@ -1792,15 +2038,23 @@ fn render_ip_view(
     if dc.show_org {
         widths.push(Constraint::Length((27 + extra_width) as u16));
     }
+    if dc.show_country {
+        widths.push(Constraint::Length(4));
+    }
+    if dc.show_domain {
+        widths.push(Constraint::Length((22 + extra_width) as u16));
+    }
     if dc.show_ua {
         widths.push(Constraint::Min(20));
     }
 
     let toggles = format!(
-        "r:{} u:{} o:{} c:{}",
+        "r:{} u:{} o:{} y:{} d:{} c:{}",
         if dc.show_rdns { "on" } else { "off" },
         if dc.show_ua { "on" } else { "off" },
         if dc.show_org { "on" } else { "off" },
+        if dc.show_country { "on" } else { "off" },
+        if dc.show_domain { "on" } else { "off" },
         if dc.cloud_detail { "detail" } else { "agg" },
     );
 
@@ -1819,7 +2073,7 @@ fn render_ip_view(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} IPs, {} lines{} [{}] [by:{}]{}{} (g/s/r/u/o/c/f/?=help, q=quit)",
+            " {} IPs, {} lines{} [{}] [by:{}]{}{} (g/s/r/u/o/y/d/c/f/?=help, q=quit)",
             filter_desc,
             total_lines,
             pending_str,
@@ -2474,63 +2728,111 @@ async fn load_or_fetch_cloud_cache(
 async fn perform_lookup_with_cloud(
     ip: &str,
     cloud_cache: Option<&CloudRangeCache>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let ip_clone = ip.to_string();
-
-    let rdns = tokio::task::spawn_blocking(move || {
-        if let Ok(addr) = ip_clone.parse::<IpAddr>() {
-            dns_lookup::lookup_addr(&addr).ok()
+    ipinfo_token: Option<&str>,
+    request_count: u64,
+    ipinfo_min_requests: u64,
+) -> (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<IpInfoAsn>) {
+    // Check cloud cache → result goes to infra (not org)
+    let infra = if let Some(cache) = cloud_cache {
+        if let Ok(addr) = ip.parse::<IpAddr>() {
+            cache.match_ip(&addr).map(|m| m.format_org())
         } else {
             None
         }
-    })
-    .await
-    .ok()
-    .flatten();
+    } else {
+        None
+    };
 
-    // Check cloud cache first
-    if let Some(cache) = cloud_cache {
-        if let Ok(addr) = ip.parse::<IpAddr>() {
-            if let Some(cloud_match) = cache.match_ip(&addr) {
-                return (rdns, Some(cloud_match.format_org()), None);
+    if let Some(token) = ipinfo_token {
+        // ipinfo mode: call API if count meets threshold
+        if request_count >= ipinfo_min_requests {
+            if let Some(resp) = fetch_ipinfo(ip, token).await {
+                // Use hostname as rdns if available, otherwise fall back to dns_lookup
+                let rdns = if resp.hostname.is_some() {
+                    resp.hostname.clone()
+                } else {
+                    let ip_clone = ip.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(addr) = ip_clone.parse::<IpAddr>() {
+                            dns_lookup::lookup_addr(&addr).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                };
+
+                let country = resp.country.clone();
+
+                // Determine org and company_domain
+                let (org, company_domain) = if let Some(ref company) = resp.company {
+                    (company.name.clone(), company.domain.clone())
+                } else if let Some(ref org_str) = resp.org {
+                    let (_asn, org_name) = parse_ipinfo_org(org_str);
+                    (org_name, None)
+                } else {
+                    (None, None)
+                };
+
+                // Determine ASN string and full ASN object
+                let (asn_str, asn_obj) = if let Some(ref asn) = resp.asn {
+                    (asn.asn.clone(), Some(asn.clone()))
+                } else if let Some(ref org_str) = resp.org {
+                    let (parsed_asn, _) = parse_ipinfo_org(org_str);
+                    (parsed_asn, None)
+                } else {
+                    (None, None)
+                };
+
+                return (rdns, org, asn_str, infra, country, company_domain, asn_obj);
             }
         }
-    }
-
-    // Fall back to whois if no cloud match
-    let (org, asn) = tokio::process::Command::new("whois")
-        .arg(ip)
-        .output()
+        // Below threshold or API failed: do dns_lookup + cloud only
+        let ip_clone = ip.to_string();
+        let rdns = tokio::task::spawn_blocking(move || {
+            if let Ok(addr) = ip_clone.parse::<IpAddr>() {
+                dns_lookup::lookup_addr(&addr).ok()
+            } else {
+                None
+            }
+        })
         .await
         .ok()
-        .map(|out| {
-            let text = String::from_utf8_lossy(&out.stdout);
-            (extract_org_from_whois(&text), extract_asn_from_whois(&text))
-        })
-        .unwrap_or((None, None));
-
-    (rdns, org, asn)
-}
-
-fn extract_asn_from_whois(text: &str) -> Option<String> {
-    let patterns = [
-        r"(?i)^OriginAS:\s*(AS\d+)",
-        r"(?i)^origin:\s*(AS\d+)",
-        r"(?i)^aut-num:\s*(AS\d+)",
-    ];
-
-    for pat in patterns {
-        if let Ok(re) = Regex::new(pat) {
-            for line in text.lines() {
-                if let Some(cap) = re.captures(line) {
-                    if let Some(m) = cap.get(1) {
-                        return Some(m.as_str().to_uppercase());
-                    }
-                }
+        .flatten();
+        (rdns, None, None, infra, None, None, None)
+    } else {
+        // No ipinfo token: dns_lookup + cloud/whois
+        let ip_clone = ip.to_string();
+        let rdns = tokio::task::spawn_blocking(move || {
+            if let Ok(addr) = ip_clone.parse::<IpAddr>() {
+                dns_lookup::lookup_addr(&addr).ok()
+            } else {
+                None
             }
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if infra.is_some() {
+            // Cloud matched: skip whois
+            (rdns, None, None, infra, None, None, None)
+        } else {
+            // No cloud match: run whois for org only
+            let org = tokio::process::Command::new("whois")
+                .arg(ip)
+                .output()
+                .await
+                .ok()
+                .and_then(|out| {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    extract_org_from_whois(&text)
+                });
+            (rdns, org, None, infra, None, None, None)
         }
     }
-    None
 }
 
 fn extract_org_from_whois(text: &str) -> Option<String> {
@@ -2568,13 +2870,32 @@ fn init_db(conn: &Connection) -> Result<()> {
             reverse_dns TEXT,
             org TEXT,
             user_agent TEXT,
-            insert_date TEXT NOT NULL
+            insert_date TEXT NOT NULL,
+            asn TEXT,
+            infra TEXT,
+            country TEXT,
+            company_domain TEXT
         )",
         [],
     )?;
 
-    // Migrate: add asn column if missing
+    // Migrate: add columns if missing (for existing DBs)
     conn.execute("ALTER TABLE ips ADD COLUMN asn TEXT", []).ok();
+    conn.execute("ALTER TABLE ips ADD COLUMN infra TEXT", []).ok();
+    conn.execute("ALTER TABLE ips ADD COLUMN country TEXT", []).ok();
+    conn.execute("ALTER TABLE ips ADD COLUMN company_domain TEXT", []).ok();
+
+    // ASN details table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS asns (
+            asn TEXT PRIMARY KEY,
+            name TEXT,
+            domain TEXT,
+            route TEXT,
+            asn_type TEXT
+        )",
+        [],
+    )?;
 
     // Create cloud_ranges table
     conn.execute(
@@ -2633,9 +2954,12 @@ fn get_ip_record(
     Option<String>,
     Option<String>,
     bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 )> {
     conn.query_row(
-        "SELECT ip, is_v6, user_agent, reverse_dns, org, asn, looked_up FROM ips WHERE ip = ?",
+        "SELECT ip, is_v6, user_agent, reverse_dns, org, asn, looked_up, infra, country, company_domain FROM ips WHERE ip = ?",
         [ip],
         |row| {
             Ok((
@@ -2646,6 +2970,9 @@ fn get_ip_record(
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, i32>(6)? != 0,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         },
     )
@@ -2673,10 +3000,28 @@ fn update_ip_lookup(
     rdns: Option<&str>,
     org: Option<&str>,
     asn: Option<&str>,
+    infra: Option<&str>,
+    country: Option<&str>,
+    company_domain: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE ips SET looked_up = 1, reverse_dns = ?, org = ?, asn = ? WHERE ip = ?",
-        params![rdns, org, asn, ip],
+        "UPDATE ips SET looked_up = 1, reverse_dns = ?, org = ?, asn = ?, infra = ?, country = ?, company_domain = ? WHERE ip = ?",
+        params![rdns, org, asn, infra, country, company_domain, ip],
+    )?;
+    Ok(())
+}
+
+fn store_asn(
+    conn: &Connection,
+    asn: &str,
+    name: Option<&str>,
+    domain: Option<&str>,
+    route: Option<&str>,
+    asn_type: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO asns (asn, name, domain, route, asn_type) VALUES (?, ?, ?, ?, ?)",
+        params![asn, name, domain, route, asn_type],
     )?;
     Ok(())
 }
@@ -4151,36 +4496,73 @@ mod tests {
         assert_eq!(result.provider, CloudProvider::AWS);
     }
 
-    // ===== ASN Extraction Tests =====
+    // ===== parse_ipinfo_org Tests =====
 
     #[test]
-    fn test_extract_asn_arin_format() {
-        let whois = "NetRange:       52.93.153.0 - 52.93.153.255\nOriginAS:       AS16509\nOrgName:        Amazon\n";
-        assert_eq!(extract_asn_from_whois(whois), Some("AS16509".to_string()));
+    fn test_parse_ipinfo_org_standard() {
+        let (asn, org) = parse_ipinfo_org("AS15169 Google LLC");
+        assert_eq!(asn, Some("AS15169".to_string()));
+        assert_eq!(org, Some("Google LLC".to_string()));
     }
 
     #[test]
-    fn test_extract_asn_ripe_format() {
-        let whois = "inetnum:        185.0.0.0 - 185.0.0.255\norigin:         AS13335\norg-name:       Cloudflare\n";
-        assert_eq!(extract_asn_from_whois(whois), Some("AS13335".to_string()));
+    fn test_parse_ipinfo_org_no_asn() {
+        let (asn, org) = parse_ipinfo_org("Google LLC");
+        assert_eq!(asn, None);
+        assert_eq!(org, Some("Google LLC".to_string()));
     }
 
     #[test]
-    fn test_extract_asn_aut_num_format() {
-        let whois = "aut-num:        AS15169\nas-name:        GOOGLE\n";
-        assert_eq!(extract_asn_from_whois(whois), Some("AS15169".to_string()));
+    fn test_parse_ipinfo_org_asn_only() {
+        let (asn, org) = parse_ipinfo_org("AS15169");
+        assert_eq!(asn, Some("AS15169".to_string()));
+        assert_eq!(org, None);
     }
 
     #[test]
-    fn test_extract_asn_not_found() {
-        let whois = "NetRange:       10.0.0.0 - 10.255.255.255\nOrgName:        Private\n";
-        assert_eq!(extract_asn_from_whois(whois), None);
+    fn test_parse_ipinfo_org_extra_spaces() {
+        let (asn, org) = parse_ipinfo_org("  AS16509  Amazon.com, Inc.  ");
+        assert_eq!(asn, Some("AS16509".to_string()));
+        assert_eq!(org, Some("Amazon.com, Inc.".to_string()));
+    }
+
+    // ===== display_org_with_infra Tests =====
+
+    #[test]
+    fn test_display_org_with_infra_both() {
+        assert_eq!(
+            display_org_with_infra(Some("Google LLC"), Some("AWS / EC2 / us-east-1"), true),
+            "Google LLC (AWS / EC2 / us-east-1)"
+        );
     }
 
     #[test]
-    fn test_extract_asn_lowercase_normalized() {
-        let whois = "origin:         as12345\n";
-        assert_eq!(extract_asn_from_whois(whois), Some("AS12345".to_string()));
+    fn test_display_org_with_infra_org_only() {
+        assert_eq!(
+            display_org_with_infra(Some("Google LLC"), None, true),
+            "Google LLC"
+        );
+    }
+
+    #[test]
+    fn test_display_org_with_infra_infra_only() {
+        assert_eq!(
+            display_org_with_infra(None, Some("AWS / EC2 / us-east-1"), true),
+            "(AWS / EC2 / us-east-1)"
+        );
+    }
+
+    #[test]
+    fn test_display_org_with_infra_neither() {
+        assert_eq!(display_org_with_infra(None, None, true), "-");
+    }
+
+    #[test]
+    fn test_display_org_with_infra_cloud_detail_off() {
+        assert_eq!(
+            display_org_with_infra(Some("Google LLC"), Some("AWS / EC2 / us-east-1"), false),
+            "Google LLC (AWS)"
+        );
     }
 
     // ===== Cloud Provider Prefix Tests =====
@@ -4254,5 +4636,93 @@ mod tests {
         assert_eq!(GroupBy::Org.label(), "Org");
         assert_eq!(GroupBy::Asn.label(), "ASN");
         assert_eq!(GroupBy::UserAgent.label(), "UA");
+    }
+
+    // ===== IpInfo Structured Response Tests =====
+
+    #[test]
+    fn test_ipinfo_response_structured() {
+        let json = r#"{
+            "ip": "8.8.8.8",
+            "hostname": "dns.google",
+            "city": "Mountain View",
+            "region": "California",
+            "country": "US",
+            "loc": "37.4056,-122.0775",
+            "org": "AS15169 Google LLC",
+            "postal": "94043",
+            "timezone": "America/Los_Angeles",
+            "asn": {
+                "asn": "AS15169",
+                "name": "Google LLC",
+                "domain": "google.com",
+                "route": "8.8.8.0/24",
+                "type": "hosting"
+            },
+            "company": {
+                "name": "Google LLC",
+                "domain": "google.com",
+                "type": "hosting"
+            }
+        }"#;
+
+        let resp: IpInfoResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.hostname.as_deref(), Some("dns.google"));
+        assert_eq!(resp.country.as_deref(), Some("US"));
+        assert_eq!(resp.org.as_deref(), Some("AS15169 Google LLC"));
+
+        let asn = resp.asn.unwrap();
+        assert_eq!(asn.asn.as_deref(), Some("AS15169"));
+        assert_eq!(asn.name.as_deref(), Some("Google LLC"));
+        assert_eq!(asn.domain.as_deref(), Some("google.com"));
+        assert_eq!(asn.route.as_deref(), Some("8.8.8.0/24"));
+        assert_eq!(asn.asn_type.as_deref(), Some("hosting"));
+
+        let company = resp.company.unwrap();
+        assert_eq!(company.name.as_deref(), Some("Google LLC"));
+        assert_eq!(company.domain.as_deref(), Some("google.com"));
+    }
+
+    #[test]
+    fn test_ipinfo_response_free_tier() {
+        let json = r#"{
+            "ip": "8.8.8.8",
+            "city": "Mountain View",
+            "region": "California",
+            "country": "US",
+            "loc": "37.4056,-122.0775",
+            "org": "AS15169 Google LLC",
+            "postal": "94043",
+            "timezone": "America/Los_Angeles"
+        }"#;
+
+        let resp: IpInfoResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.hostname, None);
+        assert_eq!(resp.country.as_deref(), Some("US"));
+        assert_eq!(resp.org.as_deref(), Some("AS15169 Google LLC"));
+        assert!(resp.asn.is_none());
+        assert!(resp.company.is_none());
+    }
+
+    #[test]
+    fn test_store_asn() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_file.path()).unwrap();
+        init_db(&conn).unwrap();
+
+        store_asn(&conn, "AS15169", Some("Google LLC"), Some("google.com"), Some("8.8.8.0/24"), Some("hosting")).unwrap();
+
+        let (name, domain, route, asn_type): (Option<String>, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT name, domain, route, asn_type FROM asns WHERE asn = ?",
+                ["AS15169"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(name.as_deref(), Some("Google LLC"));
+        assert_eq!(domain.as_deref(), Some("google.com"));
+        assert_eq!(route.as_deref(), Some("8.8.8.0/24"));
+        assert_eq!(asn_type.as_deref(), Some("hosting"));
     }
 }
