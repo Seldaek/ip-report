@@ -17,10 +17,11 @@ use ratatui::{
 use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use flate2::read::GzDecoder;
 use std::{
     collections::HashMap,
     fs::File,
-    io::{stderr, stdout, BufRead, BufReader, Write},
+    io::{stderr, stdout, BufRead, BufReader, Read, Write},
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -377,8 +378,8 @@ impl LogParser for GenericParser {
     about = "Analyze IP addresses from log files"
 )]
 struct Args {
-    /// Input file to parse
-    file: PathBuf,
+    /// Input file(s) to parse (supports .gz)
+    files: Vec<PathBuf>,
     /// Show only top N IPs, or top N% (e.g., "10" or "10%") [default: 10000]
     #[arg(long)]
     top: Option<String>,
@@ -797,8 +798,8 @@ fn main() -> Result<()> {
         Box::new(GenericParser::new()?)
     };
 
-    let (ip_counts, total_lines, global_ua_counts, global_ua_bytes) = parse_file(
-        &args.file,
+    let (ip_counts, total_lines, global_ua_counts, global_ua_bytes) = parse_files(
+        &args.files,
         args.filter.as_deref(),
         args.ua_filter.as_deref(),
         args.max_lines,
@@ -935,8 +936,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_file(
-    path: &PathBuf,
+fn parse_files(
+    paths: &[PathBuf],
     filter: Option<&str>,
     ua_filter: Option<&str>,
     max_lines: Option<u64>,
@@ -947,10 +948,6 @@ fn parse_file(
     HashMap<String, u64>,
     HashMap<String, u64>,
 )> {
-    let file = File::open(path).context("Failed to open input file")?;
-    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
-
     let filter_re = filter
         .map(|p| Regex::new(p))
         .transpose()
@@ -964,81 +961,109 @@ fn parse_file(
     let mut global_ua_counts: HashMap<String, u64> = HashMap::new();
     let mut global_ua_bytes: HashMap<String, u64> = HashMap::new();
     let mut total_lines: u64 = 0;
-    let mut bytes_read: u64 = 0;
-    let mut last_progress: u64 = 0;
+    let mut any_progress = false;
     let mut line = String::new();
+    let mut hit_max = false;
 
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
+    for path in paths {
+        if hit_max {
             break;
         }
-        bytes_read += n as u64;
 
-        if bytes_read - last_progress > 10_000_000 {
-            last_progress = bytes_read;
-            if file_size > 0 {
-                eprint!(
-                    "\rReading: {}% ({} lines)",
-                    bytes_read * 100 / file_size,
-                    total_lines
-                );
-            } else {
-                eprint!("\rReading: {} bytes ({} lines)", bytes_read, total_lines);
-            }
-            stderr().flush().ok();
-        }
+        let file = File::open(path)
+            .with_context(|| format!("Failed to open input file: {}", path.display()))?;
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let filename = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_gz = path.extension().map_or(false, |ext| ext == "gz");
 
-        let line = line.trim_end();
-
-        if let Some(ref re) = filter_re {
-            if !re.is_match(line) {
-                continue;
-            }
-        }
-
-        let parsed = match parser.parse_line(line) {
-            Some(p) => p,
-            None => continue,
+        let inner: Box<dyn Read> = if is_gz {
+            Box::new(GzDecoder::new(file))
+        } else {
+            Box::new(file)
         };
+        let mut reader = BufReader::with_capacity(1024 * 1024, inner);
 
-        if let Some(ref re) = ua_filter_re {
-            match &parsed.user_agent {
-                Some(ua) if re.is_match(ua) => {}
-                _ => continue,
-            }
-        }
+        let mut bytes_read: u64 = 0;
+        let mut last_progress: u64 = 0;
 
-        total_lines += 1;
-
-        if let Some(max) = max_lines {
-            if total_lines >= max {
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
                 break;
             }
-        }
+            bytes_read += n as u64;
 
-        let entry = counts.entry(parsed.ip).or_insert((0, HashMap::new(), 0));
-        entry.0 += 1;
-        entry.2 += parsed.bytes;
-        if let Some(ref ua_str) = parsed.user_agent {
-            if !ua_str.is_empty() {
-                *entry.1.entry(ua_str.clone()).or_insert(0) += 1;
-                let ua_base = extract_ua_base(ua_str);
-                if !ua_base.is_empty() {
-                    if let Some(c) = global_ua_counts.get_mut(ua_base) {
-                        *c += 1;
-                        *global_ua_bytes.get_mut(ua_base).unwrap() += parsed.bytes;
-                    } else {
-                        global_ua_counts.insert(ua_base.to_string(), 1);
-                        global_ua_bytes.insert(ua_base.to_string(), parsed.bytes);
+            if bytes_read - last_progress > 10_000_000 {
+                last_progress = bytes_read;
+                any_progress = true;
+                if !is_gz && file_size > 0 {
+                    eprint!(
+                        "\rReading {}: {}% ({} lines)",
+                        filename,
+                        bytes_read * 100 / file_size,
+                        total_lines
+                    );
+                } else {
+                    eprint!(
+                        "\rReading {}: {} bytes ({} lines)",
+                        filename, bytes_read, total_lines
+                    );
+                }
+                stderr().flush().ok();
+            }
+
+            let line = line.trim_end();
+
+            if let Some(ref re) = filter_re {
+                if !re.is_match(line) {
+                    continue;
+                }
+            }
+
+            let parsed = match parser.parse_line(line) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if let Some(ref re) = ua_filter_re {
+                match &parsed.user_agent {
+                    Some(ua) if re.is_match(ua) => {}
+                    _ => continue,
+                }
+            }
+
+            total_lines += 1;
+
+            if let Some(max) = max_lines {
+                if total_lines >= max {
+                    hit_max = true;
+                    break;
+                }
+            }
+
+            let entry = counts.entry(parsed.ip).or_insert((0, HashMap::new(), 0));
+            entry.0 += 1;
+            entry.2 += parsed.bytes;
+            if let Some(ref ua_str) = parsed.user_agent {
+                if !ua_str.is_empty() {
+                    *entry.1.entry(ua_str.clone()).or_insert(0) += 1;
+                    let ua_base = extract_ua_base(ua_str);
+                    if !ua_base.is_empty() {
+                        if let Some(c) = global_ua_counts.get_mut(ua_base) {
+                            *c += 1;
+                            *global_ua_bytes.get_mut(ua_base).unwrap() += parsed.bytes;
+                        } else {
+                            global_ua_counts.insert(ua_base.to_string(), 1);
+                            global_ua_bytes.insert(ua_base.to_string(), parsed.bytes);
+                        }
                     }
                 }
             }
         }
     }
 
-    if last_progress > 0 {
+    if any_progress {
         eprintln!("\rReading: done ({} lines)        ", total_lines);
     }
 
@@ -3969,7 +3994,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
+            parse_files(&[path.clone()], None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 6);
         assert_eq!(ip_counts.len(), 5); // 5 unique IPs
@@ -4003,8 +4028,8 @@ mod tests {
         writeln!(file, "192.168.1.1,200,GET,curl/8.0.0").unwrap();
         drop(file);
 
-        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_file(
-            &path,
+        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_files(
+            &[path.clone()],
             None,
             None,
             None,
@@ -4033,8 +4058,8 @@ mod tests {
         drop(file);
 
         // Filter only GET requests
-        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_file(
-            &path,
+        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_files(
+            &[path.clone()],
             Some("GET"),
             None,
             None,
@@ -4063,8 +4088,8 @@ mod tests {
         drop(file);
 
         // Filter only curl user agents
-        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_file(
-            &path,
+        let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) = parse_files(
+            &[path.clone()],
             None,
             Some("curl"),
             None,
@@ -4103,8 +4128,8 @@ mod tests {
         writeln!(file, "192.168.1.2;404;512;wget/1.20").unwrap();
         drop(file);
 
-        let (ip_counts, total_lines, _global_ua_counts, global_ua_bytes) = parse_file(
-            &path,
+        let (ip_counts, total_lines, _global_ua_counts, global_ua_bytes) = parse_files(
+            &[path.clone()],
             None,
             None,
             None,
@@ -4138,7 +4163,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, global_ua_bytes) =
-            parse_file(&path, None, None, None, &NginxParser::new().unwrap()).unwrap();
+            parse_files(&[path.clone()], None, None, None, &NginxParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 2);
@@ -4173,7 +4198,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, _, _) =
-            parse_file(&path, None, None, None, &NginxParser::new().unwrap()).unwrap();
+            parse_files(&[path.clone()], None, None, None, &NginxParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 1);
         assert_eq!(ip_counts.len(), 1);
@@ -4377,7 +4402,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
+            parse_files(&[path.clone()], None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 3);
@@ -4406,7 +4431,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
+            parse_files(&[path.clone()], None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 4);
         assert_eq!(ip_counts.len(), 4);
@@ -4429,7 +4454,7 @@ mod tests {
         drop(file);
 
         let (ip_counts, total_lines, global_ua_counts, _global_ua_bytes) =
-            parse_file(&path, None, None, None, &GenericParser::new().unwrap()).unwrap();
+            parse_files(&[path.clone()], None, None, None, &GenericParser::new().unwrap()).unwrap();
 
         assert_eq!(total_lines, 3);
         assert_eq!(ip_counts.len(), 3);
@@ -4437,6 +4462,62 @@ mod tests {
         // Only curl should be counted
         assert_eq!(global_ua_counts.len(), 1);
         assert_eq!(global_ua_counts.get("curl"), Some(&1));
+    }
+
+    #[test]
+    fn test_parse_files_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gz_path = dir.path().join("test.log.gz");
+
+        let f = std::fs::File::create(&gz_path).unwrap();
+        let mut gz = GzEncoder::new(f, Compression::default());
+        writeln!(gz, "192.168.1.1 \"curl/7.64.0\"").unwrap();
+        writeln!(gz, "192.168.1.2 \"wget/1.20\"").unwrap();
+        writeln!(gz, "192.168.1.1 \"curl/8.0.0\"").unwrap();
+        gz.finish().unwrap();
+
+        let (ip_counts, total_lines, global_ua_counts, _) =
+            parse_files(&[gz_path], None, None, None, &GenericParser::new().unwrap()).unwrap();
+
+        assert_eq!(total_lines, 3);
+        assert_eq!(ip_counts.len(), 2);
+        assert_eq!(ip_counts.get("192.168.1.1").unwrap().0, 2);
+        assert_eq!(ip_counts.get("192.168.1.2").unwrap().0, 1);
+        assert_eq!(global_ua_counts.get("curl"), Some(&2));
+        assert_eq!(global_ua_counts.get("wget"), Some(&1));
+    }
+
+    #[test]
+    fn test_parse_files_multiple() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("a.log");
+        let path2 = dir.path().join("b.log");
+
+        let mut f1 = std::fs::File::create(&path1).unwrap();
+        writeln!(f1, "192.168.1.1 \"curl/7.64.0\"").unwrap();
+        writeln!(f1, "192.168.1.2 \"wget/1.20\"").unwrap();
+        drop(f1);
+
+        let mut f2 = std::fs::File::create(&path2).unwrap();
+        writeln!(f2, "192.168.1.1 \"curl/8.0.0\"").unwrap();
+        writeln!(f2, "10.0.0.1 \"Python-requests/2.28\"").unwrap();
+        drop(f2);
+
+        let (ip_counts, total_lines, global_ua_counts, _) =
+            parse_files(&[path1, path2], None, None, None, &GenericParser::new().unwrap()).unwrap();
+
+        assert_eq!(total_lines, 4);
+        assert_eq!(ip_counts.len(), 3); // 192.168.1.1, 192.168.1.2, 10.0.0.1
+        assert_eq!(ip_counts.get("192.168.1.1").unwrap().0, 2); // aggregated across files
+        assert_eq!(global_ua_counts.get("curl"), Some(&2));
+        assert_eq!(global_ua_counts.get("wget"), Some(&1));
+        assert_eq!(global_ua_counts.get("Python-requests"), Some(&1));
     }
 
     #[test]

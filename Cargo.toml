@@ -28,6 +28,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
 ipnetwork = "0.20"
+flate2 = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
