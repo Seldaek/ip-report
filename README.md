@@ -4,6 +4,8 @@ A fast CLI tool to analyze IP addresses from log files, with optional reverse DN
 
 ## Features
 
+- Accepts multiple log files at once (aggregates results)
+- Transparent gzip (`.gz`) decompression
 - Parses log files efficiently with progress indicator
 - Supports all IPv6 formats including compressed (`::`) notation
 - Built-in format presets for nginx and Bunny CDN logs
@@ -44,6 +46,11 @@ Analyze an nginx access log (auto-detected format):
 ip-report /var/log/nginx/access.log
 ```
 
+Analyze multiple files at once (including gzipped):
+```bash
+ip-report access.log access.log.1 access.log.2.gz
+```
+
 Use the nginx format preset (extracts IP, bytes, and user agent in one pass):
 ```bash
 ip-report access.log --format nginx
@@ -67,10 +74,10 @@ ip-report access.log --top 20
 ## Usage
 
 ```
-ip-report [OPTIONS] <FILE>
+ip-report [OPTIONS] <FILES>...
 
 Arguments:
-  <FILE>  Input file to parse
+  <FILES>...  Input file(s) to parse (supports .gz)
 
 Options:
       --top <TOP>              Show only top N IPs (e.g., "10" or "10%") [default: 10000]
@@ -158,9 +165,14 @@ Only parse first 100k lines of a large file:
 ip-report huge.log --max-lines 100000
 ```
 
+Analyze all rotated logs including gzipped ones:
+```bash
+ip-report access.log access.log.1 access.log.2.gz access.log.3.gz
+```
+
 ## How it works
 
-1. **Parsing**: Reads the file line by line with progress. In default mode, tries first word as IP (fast path), falls back to regex. In delimiter mode, splits by delimiter and uses specified field or auto-finds IP. Format presets (`--format`) configure delimiter/field settings automatically.
+1. **Parsing**: Reads each input file line by line with progress. Files ending in `.gz` are transparently decompressed. Results are aggregated across all files. In default mode, tries first word as IP (fast path), falls back to regex. In delimiter mode, splits by delimiter and uses specified field or auto-finds IP. Format presets (`--format`) configure delimiter/field settings automatically.
 
 2. **Database**: For each filtered IP, checks SQLite cache. New IPs are inserted; IPs without lookup data trigger async lookups.
 
@@ -199,6 +211,8 @@ ip-report huge.log --max-lines 100000
 - The database caches lookup results indefinitely; delete the `.db` file to force fresh lookups
 - Lookups that fail silently show `-` in the output
 - `--filter` and `--ua-filter` use Rust regex syntax; use `(?i)` prefix for case-insensitive
+- `--max-lines` applies globally across all input files
+- `.gz` files show bytes read instead of percentage in progress (compressed size ≠ decompressed size)
 
 ## License
 

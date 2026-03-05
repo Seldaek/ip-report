@@ -620,17 +620,74 @@ struct IpInfoResponse {
     company: Option<IpInfoCompany>,
 }
 
-async fn fetch_ipinfo(ip: &str, token: &str) -> Option<IpInfoResponse> {
+async fn fetch_ipinfo(ip: &str, token: &str) -> Result<IpInfoResponse> {
     let url = format!("https://ipinfo.io/{}?token={}", ip, token);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
+        .context("Failed to build HTTP client for ipinfo")?;
+
+    let max_attempts = 3;
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        let result = client.get(&url).send().await;
+
+        match result {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return resp
+                        .json::<IpInfoResponse>()
+                        .await
+                        .with_context(|| format!("Failed to parse ipinfo JSON for {}", ip));
+                }
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    // Rate limited — back off and retry (don't count as a normal retry)
+                    let wait = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "Warning: ipinfo rate limited for {}, backing off {}s",
+                        ip,
+                        wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    if attempt >= max_attempts {
+                        anyhow::bail!(
+                            "ipinfo rate limited for {} after {} attempts",
+                            ip,
+                            max_attempts
+                        );
+                    }
+                    continue;
+                }
+                if attempt < max_attempts && status.is_server_error() {
+                    let wait = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "Warning: ipinfo returned {} for {}, retrying in {}s",
+                        status, ip, wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                anyhow::bail!("ipinfo request failed for {}: HTTP {}", ip, status);
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    let wait = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "Warning: ipinfo request error for {}: {}, retrying in {}s",
+                        ip, e, wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                return Err(e).with_context(|| {
+                    format!("ipinfo request failed for {} after {} attempts", ip, max_attempts)
+                });
+            }
+        }
     }
-    resp.json::<IpInfoResponse>().await.ok()
 }
 
 fn parse_ipinfo_org(org: &str) -> (Option<String>, Option<String>) {
@@ -2771,50 +2828,56 @@ async fn perform_lookup_with_cloud(
     if let Some(token) = ipinfo_token {
         // ipinfo mode: call API if count meets threshold
         if request_count >= ipinfo_min_requests {
-            if let Some(resp) = fetch_ipinfo(ip, token).await {
-                // Use hostname as rdns if available, otherwise fall back to dns_lookup
-                let rdns = if resp.hostname.is_some() {
-                    resp.hostname.clone()
-                } else {
-                    let ip_clone = ip.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(addr) = ip_clone.parse::<IpAddr>() {
-                            dns_lookup::lookup_addr(&addr).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                };
+            match fetch_ipinfo(ip, token).await {
+                Ok(resp) => {
+                    // Use hostname as rdns if available, otherwise fall back to dns_lookup
+                    let rdns = if resp.hostname.is_some() {
+                        resp.hostname.clone()
+                    } else {
+                        let ip_clone = ip.to_string();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(addr) = ip_clone.parse::<IpAddr>() {
+                                dns_lookup::lookup_addr(&addr).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    };
 
-                let country = resp.country.clone();
+                    let country = resp.country.clone();
 
-                // Determine org and company_domain
-                let (org, company_domain) = if let Some(ref company) = resp.company {
-                    (company.name.clone(), company.domain.clone())
-                } else if let Some(ref org_str) = resp.org {
-                    let (_asn, org_name) = parse_ipinfo_org(org_str);
-                    (org_name, None)
-                } else {
-                    (None, None)
-                };
+                    // Determine org and company_domain
+                    let (org, company_domain) = if let Some(ref company) = resp.company {
+                        (company.name.clone(), company.domain.clone())
+                    } else if let Some(ref org_str) = resp.org {
+                        let (_asn, org_name) = parse_ipinfo_org(org_str);
+                        (org_name, None)
+                    } else {
+                        (None, None)
+                    };
 
-                // Determine ASN string and full ASN object
-                let (asn_str, asn_obj) = if let Some(ref asn) = resp.asn {
-                    (asn.asn.clone(), Some(asn.clone()))
-                } else if let Some(ref org_str) = resp.org {
-                    let (parsed_asn, _) = parse_ipinfo_org(org_str);
-                    (parsed_asn, None)
-                } else {
-                    (None, None)
-                };
+                    // Determine ASN string and full ASN object
+                    let (asn_str, asn_obj) = if let Some(ref asn) = resp.asn {
+                        (asn.asn.clone(), Some(asn.clone()))
+                    } else if let Some(ref org_str) = resp.org {
+                        let (parsed_asn, _) = parse_ipinfo_org(org_str);
+                        (parsed_asn, None)
+                    } else {
+                        (None, None)
+                    };
 
-                return (rdns, org, asn_str, infra, country, company_domain, asn_obj);
+                    return (rdns, org, asn_str, infra, country, company_domain, asn_obj);
+                }
+                Err(e) => {
+                    eprintln!("ERROR: ipinfo lookup failed for {}: {:#}", ip, e);
+                    std::process::exit(1);
+                }
             }
         }
-        // Below threshold or API failed: do dns_lookup + cloud only
+        // Below threshold: do dns_lookup + cloud only
         let ip_clone = ip.to_string();
         let rdns = tokio::task::spawn_blocking(move || {
             if let Ok(addr) = ip_clone.parse::<IpAddr>() {
