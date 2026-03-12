@@ -690,6 +690,77 @@ async fn fetch_ipinfo(ip: &str, token: &str) -> Result<IpInfoResponse> {
     }
 }
 
+async fn fetch_ipinfo_batch(ips: &[&str], token: &str) -> Result<HashMap<String, IpInfoResponse>> {
+    let url = format!("https://ipinfo.io/batch?token={}", token);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client for ipinfo batch")?;
+
+    let max_attempts = 3;
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        let result = client
+            .post(&url)
+            .json(&ips)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return resp
+                        .json::<HashMap<String, IpInfoResponse>>()
+                        .await
+                        .context("Failed to parse ipinfo batch JSON");
+                }
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let wait = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "Warning: ipinfo batch rate limited, backing off {}s",
+                        wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    if attempt >= max_attempts {
+                        anyhow::bail!(
+                            "ipinfo batch rate limited after {} attempts",
+                            max_attempts
+                        );
+                    }
+                    continue;
+                }
+                if attempt < max_attempts && status.is_server_error() {
+                    let wait = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "Warning: ipinfo batch returned {}, retrying in {}s",
+                        status, wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                anyhow::bail!("ipinfo batch request failed: HTTP {}", status);
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    let wait = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "Warning: ipinfo batch request error: {}, retrying in {}s",
+                        e, wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                return Err(e).with_context(|| {
+                    format!("ipinfo batch request failed after {} attempts", max_attempts)
+                });
+            }
+        }
+    }
+}
+
 fn parse_ipinfo_org(org: &str) -> (Option<String>, Option<String>) {
     let trimmed = org.trim();
     if trimmed.is_empty() {
@@ -1294,7 +1365,134 @@ async fn run_lookups_and_display(
     if !ips_to_lookup.is_empty() {
         eprintln!("Looking up {} IPs...", ips_to_lookup.len());
     }
-    for (ip, count) in ips_to_lookup {
+
+    // Split IPs into batch-eligible (ipinfo with token + meets threshold) and non-batch
+    let (batch_ips, non_batch_ips): (Vec<_>, Vec<_>) = if ipinfo_token.is_some() {
+        ips_to_lookup.iter().cloned().partition(|(_, count)| *count >= ipinfo_min_requests)
+    } else {
+        (vec![], ips_to_lookup.clone())
+    };
+
+    // Process ipinfo-eligible IPs via batch API (spawned so TUI can start immediately)
+    if !batch_ips.is_empty() {
+        let batch_ip_strings: Vec<String> = batch_ips.iter().map(|(ip, _)| ip.clone()).collect();
+        // Pre-chunk into owned vectors for the spawned task
+        let chunks: Vec<Vec<String>> = batch_ip_strings.chunks(1000).map(|c| c.to_vec()).collect();
+        let recs = records.clone();
+        let dbp = db_path.clone();
+        let cache = cloud_cache.clone();
+        let token = ipinfo_token.clone().unwrap();
+
+        let handle = tokio::spawn(async move {
+            for chunk in chunks {
+                let chunk_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                match fetch_ipinfo_batch(&chunk_refs, &token).await {
+                    Ok(batch_results) => {
+                        // Spawn DNS lookups for IPs missing hostname
+                        let mut dns_handles: Vec<(String, tokio::task::JoinHandle<Option<String>>)> = vec![];
+                        for ip_str in &chunk {
+                            let resp = batch_results.get(ip_str.as_str());
+                            let needs_dns = resp.map_or(true, |r| r.hostname.is_none());
+                            if needs_dns {
+                                let ip_clone = ip_str.clone();
+                                let handle = tokio::task::spawn_blocking(move || {
+                                    if let Ok(addr) = ip_clone.parse::<IpAddr>() {
+                                        dns_lookup::lookup_addr(&addr).ok()
+                                    } else {
+                                        None
+                                    }
+                                });
+                                dns_handles.push((ip_str.clone(), handle));
+                            }
+                        }
+                        // Collect DNS results
+                        let mut dns_results: HashMap<String, Option<String>> = HashMap::new();
+                        for (ip_str, handle) in dns_handles {
+                            dns_results.insert(ip_str, handle.await.ok().flatten());
+                        }
+
+                        // Process each IP's results
+                        if let Ok(conn) = Connection::open(&dbp) {
+                            for ip_str in &chunk {
+                                let (rdns, org, asn_str, country, company_domain, asn_obj) =
+                                    if let Some(resp) = batch_results.get(ip_str.as_str()) {
+                                        let rdns = if resp.hostname.is_some() {
+                                            resp.hostname.clone()
+                                        } else {
+                                            dns_results.get(ip_str.as_str()).cloned().flatten()
+                                        };
+                                        let country = resp.country.clone();
+                                        let (org, company_domain) = if let Some(ref company) = resp.company {
+                                            (company.name.clone(), company.domain.clone())
+                                        } else if let Some(ref org_str) = resp.org {
+                                            let (_asn, org_name) = parse_ipinfo_org(org_str);
+                                            (org_name, None)
+                                        } else {
+                                            (None, None)
+                                        };
+                                        let (asn_str, asn_obj) = if let Some(ref asn) = resp.asn {
+                                            (asn.asn.clone(), Some(asn.clone()))
+                                        } else if let Some(ref org_str) = resp.org {
+                                            let (parsed_asn, _) = parse_ipinfo_org(org_str);
+                                            (parsed_asn, None)
+                                        } else {
+                                            (None, None)
+                                        };
+                                        (rdns, org, asn_str, country, company_domain, asn_obj)
+                                    } else {
+                                        // IP not in batch response - do DNS fallback
+                                        let rdns = dns_results.get(ip_str.as_str()).cloned().flatten();
+                                        (rdns, None, None, None, None, None)
+                                    };
+
+                                // Cloud cache check
+                                let infra = if let Some(ref cache) = cache {
+                                    if let Ok(addr) = ip_str.parse::<IpAddr>() {
+                                        cache.match_ip(&addr).map(|m| m.format_org())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                // Update in-memory records
+                                {
+                                    let mut recs = recs.lock().unwrap();
+                                    if let Some(rec) = recs.iter_mut().find(|r| r.ip == *ip_str) {
+                                        rec.reverse_dns = rdns.clone();
+                                        rec.org = org.clone();
+                                        rec.asn = asn_str.clone();
+                                        rec.infra = infra.clone();
+                                        rec.country = country.clone();
+                                        rec.company_domain = company_domain.clone();
+                                        rec.looked_up = true;
+                                        rec.lookup_in_progress = false;
+                                    }
+                                }
+
+                                // Update DB
+                                update_ip_lookup(&conn, ip_str, rdns.as_deref(), org.as_deref(), asn_str.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                                if let Some(ref asn_detail) = asn_obj {
+                                    if let Some(ref asn_id) = asn_detail.asn {
+                                        store_asn(&conn, asn_id, asn_detail.name.as_deref(), asn_detail.domain.as_deref(), asn_detail.route.as_deref(), asn_detail.asn_type.as_deref()).ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: ipinfo batch lookup failed: {:#}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Process non-batch IPs with existing per-IP spawn pattern
+    for (ip, count) in non_batch_ips {
         let sem = semaphore.clone();
         let recs = records.clone();
         let dbp = db_path.clone();
@@ -1624,7 +1822,12 @@ async fn run_tui(
         let pending = {
             let mut handles = active_handles.lock().unwrap();
             handles.retain(|h| !h.is_finished());
-            handles.len()
+            let handle_pending = handles.len();
+            // Also count IPs with lookup_in_progress (e.g. batch lookups use a single handle)
+            let ip_pending = recs.iter().filter(|r| r.lookup_in_progress).count();
+            // Use the greater of the two: handle count reflects spawned tasks,
+            // ip_pending reflects individual IPs still being processed within batch tasks
+            handle_pending.max(ip_pending)
         };
 
         terminal.draw(|f| {
@@ -1718,6 +1921,7 @@ async fn run_tui(
                             dc.cloud_detail,
                         )
                     },
+                    Some(("Domain", |r: &IpRecord| r.company_domain.clone())),
                 ),
                 GroupBy::Asn => render_grouped_view(
                     f,
@@ -1738,6 +1942,7 @@ async fn run_tui(
                             )
                         })
                     },
+                    None::<(&str, fn(&IpRecord) -> Option<String>)>,
                 ),
                 GroupBy::UserAgent => render_ua_global_view(
                     f,
@@ -1837,7 +2042,7 @@ async fn run_tui(
                         filtered_recs.iter().map(|r| (*r).clone()).collect();
                     let len = match dc.group_by {
                         GroupBy::Ip => filtered_recs.iter().filter(|r| r.in_display_set).count(),
-                        GroupBy::Org => aggregate_by_field(&filtered_owned, |r| {
+                        GroupBy::Org => aggregate_by_field(&filtered_owned, &|r: &IpRecord| {
                             display_org_with_infra(
                                 r.org.as_deref(),
                                 r.infra.as_deref(),
@@ -1845,7 +2050,7 @@ async fn run_tui(
                             )
                         })
                         .len(),
-                        GroupBy::Asn => aggregate_by_field(&filtered_owned, |r| {
+                        GroupBy::Asn => aggregate_by_field(&filtered_owned, &|r: &IpRecord| {
                             r.asn.clone().unwrap_or_else(|| {
                                 display_org_with_infra(
                                     r.org.as_deref(),
@@ -2010,7 +2215,7 @@ fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
     f.render_widget(paragraph, popup);
 }
 
-fn aggregate_by_field<F>(recs: &[IpRecord], key_fn: F) -> Vec<(String, u64, usize, u64)>
+fn aggregate_by_field<F>(recs: &[IpRecord], key_fn: &F) -> Vec<(String, u64, usize, u64)>
 where
     F: Fn(&IpRecord) -> String,
 {
@@ -2196,7 +2401,7 @@ fn render_ip_view(
     f.render_stateful_widget(table, f.area(), table_state);
 }
 
-fn render_grouped_view<F>(
+fn render_grouped_view<F, E>(
     f: &mut ratatui::Frame,
     recs: &[IpRecord],
     table_state: &mut TableState,
@@ -2207,14 +2412,36 @@ fn render_grouped_view<F>(
     search_str: &str,
     dc: &DisplayConfig,
     key_fn: F,
+    extra_col: Option<(&str, E)>,
 ) where
     F: Fn(&IpRecord) -> String,
+    E: Fn(&IpRecord) -> Option<String>,
 {
-    let mut groups = aggregate_by_field(recs, key_fn);
+    // Collect extra values per group key if extra_col is provided
+    let extra_values: HashMap<String, Vec<String>> = if let Some((_, ref extra_fn)) = extra_col {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for rec in recs {
+            let key = key_fn(rec);
+            if let Some(val) = extra_fn(rec) {
+                let entry = map.entry(key).or_default();
+                if !entry.contains(&val) {
+                    entry.push(val);
+                }
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    let mut groups = aggregate_by_field(recs, &key_fn);
     match dc.sort_by {
         SortBy::Hits => groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
         SortBy::Bandwidth => groups.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0))),
     }
+
+    let has_extra = extra_col.is_some();
+    let extra_label = extra_col.as_ref().map(|(label, _)| *label);
 
     let mut header_cells = vec![Cell::from("Count"), Cell::from("%"), Cell::from("IPs")];
     if dc.has_bytes {
@@ -2222,6 +2449,9 @@ fn render_grouped_view<F>(
         header_cells.push(Cell::from("BW%"));
     }
     header_cells.push(Cell::from(group_label));
+    if let Some(label) = extra_label {
+        header_cells.push(Cell::from(label));
+    }
 
     let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -2250,6 +2480,13 @@ fn render_grouped_view<F>(
                 cells.push(Cell::from(format!("{:.2}", bw_pct)));
             }
             cells.push(Cell::from(key.clone()));
+            if has_extra {
+                let val = extra_values
+                    .get(key)
+                    .map(|v| v.join(", "))
+                    .unwrap_or_else(|| "-".to_string());
+                cells.push(Cell::from(val));
+            }
             Row::new(cells)
         })
         .collect();
@@ -2264,6 +2501,9 @@ fn render_grouped_view<F>(
         widths.push(Constraint::Length(6));
     }
     widths.push(Constraint::Min(40));
+    if has_extra {
+        widths.push(Constraint::Min(20));
+    }
 
     let pending_str = if pending > 0 {
         format!(", {} pending", pending)
