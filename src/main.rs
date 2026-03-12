@@ -1031,7 +1031,7 @@ fn parse_files(
             .with_context(|| format!("Failed to open input file: {}", path.display()))?;
         let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let filename = path.file_name().unwrap_or_default().to_string_lossy();
-        let is_gz = path.extension().map_or(false, |ext| ext == "gz");
+        let is_gz = path.extension().map_or(false, |ext| ext == "gz" || ext == "gzip");
 
         let inner: Box<dyn Read> = if is_gz {
             Box::new(GzDecoder::new(file))
@@ -1056,14 +1056,14 @@ fn parse_files(
                 any_progress = true;
                 if !is_gz && file_size > 0 {
                     eprint!(
-                        "\rReading {}: {}% ({} lines)",
+                        "\x1B[2K\rReading {}: {}% ({} lines)",
                         filename,
                         bytes_read * 100 / file_size,
                         total_lines
                     );
                 } else {
                     eprint!(
-                        "\rReading {}: {} bytes ({} lines)",
+                        "\x1B[2K\rReading {}: {} bytes ({} lines)",
                         filename, bytes_read, total_lines
                     );
                 }
@@ -1121,7 +1121,7 @@ fn parse_files(
     }
 
     if any_progress {
-        eprintln!("\rReading: done ({} lines)        ", total_lines);
+        eprintln!("\x1B[2K\rReading: done ({} lines)", total_lines);
     }
 
     // Convert IpAddr keys to String and pick most common UA
@@ -1219,46 +1219,61 @@ async fn run_lookups_and_display(
             .collect()
     };
 
-    let records: Vec<IpRecord> = all_ips
-        .iter()
-        .map(|(ip, count, is_v6, ua, bytes, in_display)| {
-            let existing = get_ip_record(&conn, ip);
-            if let Some(rec) = existing {
-                IpRecord {
-                    ip: ip.clone(),
-                    count: *count,
-                    user_agent: ua.clone().or(rec.2),
-                    reverse_dns: rec.3,
-                    org: rec.4,
-                    asn: rec.5,
-                    infra: rec.7,
-                    country: rec.8,
-                    company_domain: rec.9,
-                    bytes: *bytes,
-                    looked_up: rec.6,
-                    lookup_in_progress: false,
-                    in_display_set: *in_display,
-                }
-            } else {
-                insert_ip(&conn, ip, *is_v6, ua.as_deref()).ok();
-                IpRecord {
-                    ip: ip.clone(),
-                    count: *count,
-                    user_agent: ua.clone(),
-                    reverse_dns: None,
-                    org: None,
-                    asn: None,
-                    infra: None,
-                    country: None,
-                    company_domain: None,
-                    bytes: *bytes,
-                    looked_up: false,
-                    lookup_in_progress: false,
-                    in_display_set: *in_display,
-                }
-            }
-        })
-        .collect();
+    let skipped = full_ip_counts.len() - all_ips.iter().map(|(ip, ..)| ip.as_str()).collect::<std::collections::HashSet<_>>().len();
+    if skipped > 0 {
+        eprintln!("Skipped {} IPs with fewer than {} hits", skipped, ipinfo_min_requests);
+    }
+
+    eprint!("\x1B[2K\rPreparing IPs: loading cache...");
+    stderr().flush().ok();
+    let all_ip_strs: Vec<&str> = all_ips.iter().map(|(ip, ..)| ip.as_str()).collect();
+    let db_cache = get_ip_records_batch(&conn, &all_ip_strs);
+    eprint!("\x1B[2K\rPreparing IPs: 0/{}", all_ips.len());
+    stderr().flush().ok();
+    let mut records: Vec<IpRecord> = Vec::with_capacity(all_ips.len());
+    conn.execute_batch("BEGIN")?;
+    for (i, (ip, count, is_v6, ua, bytes, in_display)) in all_ips.iter().enumerate() {
+        if (i + 1) % 50 == 0 || i + 1 == all_ips.len() {
+            eprint!("\x1B[2K\rPreparing IPs: {}/{}", i + 1, all_ips.len());
+            stderr().flush().ok();
+        }
+        if let Some(rec) = db_cache.get(ip) {
+            records.push(IpRecord {
+                ip: ip.clone(),
+                count: *count,
+                user_agent: ua.clone().or(rec.2.clone()),
+                reverse_dns: rec.3.clone(),
+                org: rec.4.clone(),
+                asn: rec.5.clone(),
+                infra: rec.7.clone(),
+                country: rec.8.clone(),
+                company_domain: rec.9.clone(),
+                bytes: *bytes,
+                looked_up: rec.6,
+                lookup_in_progress: false,
+                in_display_set: *in_display,
+            });
+        } else {
+            insert_ip(&conn, ip, *is_v6, ua.as_deref()).ok();
+            records.push(IpRecord {
+                ip: ip.clone(),
+                count: *count,
+                user_agent: ua.clone(),
+                reverse_dns: None,
+                org: None,
+                asn: None,
+                infra: None,
+                country: None,
+                company_domain: None,
+                bytes: *bytes,
+                looked_up: false,
+                lookup_in_progress: false,
+                in_display_set: *in_display,
+            });
+        }
+    }
+    conn.execute_batch("COMMIT")?;
+    eprintln!();
 
     let records = Arc::new(Mutex::new(records));
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -1276,6 +1291,9 @@ async fn run_lookups_and_display(
     };
 
     let mut handles = vec![];
+    if !ips_to_lookup.is_empty() {
+        eprintln!("Looking up {} IPs...", ips_to_lookup.len());
+    }
     for (ip, count) in ips_to_lookup {
         let sem = semaphore.clone();
         let recs = records.clone();
@@ -1452,8 +1470,17 @@ fn reselect_records(
         .collect();
     drop(old_recs);
 
-    // Check SQLite cache for any new IPs
+    // Batch-load SQLite cache for IPs not already in memory
     let conn = Connection::open(db_path).ok();
+    let new_ips: Vec<&str> = all_ips
+        .iter()
+        .filter(|(ip, ..)| !old_map.contains_key(ip))
+        .map(|(ip, ..)| ip.as_str())
+        .collect();
+    let db_cache = conn
+        .as_ref()
+        .map(|c| get_ip_records_batch(c, &new_ips))
+        .unwrap_or_default();
 
     let mut new_records = Vec::with_capacity(all_ips.len());
     let mut ips_to_lookup = Vec::new();
@@ -1469,18 +1496,18 @@ fn reselect_records(
                 rec.user_agent = ua;
             }
             new_records.push(rec);
-        } else if let Some(cached) = conn.as_ref().and_then(|c| get_ip_record(c, &ip)) {
+        } else if let Some(cached) = db_cache.get(&ip) {
             let needs_lookup = !cached.6;
             new_records.push(IpRecord {
                 ip: ip.clone(),
                 count,
-                user_agent: ua.or(cached.2),
-                reverse_dns: cached.3,
-                org: cached.4,
-                asn: cached.5,
-                infra: cached.7,
-                country: cached.8,
-                company_domain: cached.9,
+                user_agent: ua.or(cached.2.clone()),
+                reverse_dns: cached.3.clone(),
+                org: cached.4.clone(),
+                asn: cached.5.clone(),
+                infra: cached.7.clone(),
+                country: cached.8.clone(),
+                company_domain: cached.9.clone(),
                 bytes,
                 looked_up: cached.6,
                 lookup_in_progress: needs_lookup,
@@ -2804,7 +2831,10 @@ async fn load_or_fetch_cloud_cache(
         }
     }
 
-    CloudRangeCache::load_from_db(conn)
+    eprint!("Loading cloud range cache...");
+    let result = CloudRangeCache::load_from_db(conn);
+    eprintln!(" done");
+    result
 }
 
 async fn perform_lookup_with_cloud(
@@ -3065,6 +3095,60 @@ fn get_ip_record(
         },
     )
     .ok()
+}
+
+type IpRecordRow = (
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn get_ip_records_batch(
+    conn: &Connection,
+    ips: &[&str],
+) -> HashMap<String, IpRecordRow> {
+    let mut result = HashMap::with_capacity(ips.len());
+    // SQLite has a variable limit (default 999), batch in chunks
+    for chunk in ips.chunks(500) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT ip, is_v6, user_agent, reverse_dns, org, asn, looked_up, infra, country, company_domain FROM ips WHERE ip IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|ip| ip as &dyn rusqlite::types::ToSql).collect();
+        let rows = match stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)? != 0,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i32>(6)? != 0,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for row in rows.flatten() {
+            result.insert(row.0.clone(), row);
+        }
+    }
+    result
 }
 
 fn insert_ip(conn: &Connection, ip: &str, is_v6: bool, user_agent: Option<&str>) -> Result<()> {
