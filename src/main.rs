@@ -1815,6 +1815,7 @@ fn reselect_records(
 
     let mut new_records = Vec::with_capacity(all_ips.len());
     let mut ips_to_lookup = Vec::new();
+    let mut ips_to_insert: Vec<(String, bool, Option<String>)> = Vec::new();
 
     for (ip, count, is_v6, ua, bytes, in_display) in all_ips {
         if let Some(existing) = old_map.get(&ip) {
@@ -1848,9 +1849,7 @@ fn reselect_records(
                 ips_to_lookup.push((ip, count));
             }
         } else {
-            if let Some(c) = conn.as_ref() {
-                insert_ip(c, &ip, is_v6, ua.as_deref()).ok();
-            }
+            ips_to_insert.push((ip.clone(), is_v6, ua.clone()));
             new_records.push(IpRecord {
                 ip: ip.clone(),
                 count,
@@ -1867,6 +1866,17 @@ fn reselect_records(
                 in_display_set: in_display,
             });
             ips_to_lookup.push((ip, count));
+        }
+    }
+
+    // Batch-insert new IPs in a single transaction
+    if !ips_to_insert.is_empty() {
+        if let Some(c) = conn.as_ref() {
+            let _ = c.execute_batch("BEGIN");
+            for (ip, is_v6, ua) in &ips_to_insert {
+                insert_ip(c, ip, *is_v6, ua.as_deref()).ok();
+            }
+            let _ = c.execute_batch("COMMIT");
         }
     }
 
