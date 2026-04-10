@@ -1414,6 +1414,7 @@ async fn run_lookups_and_display(
                         // Process each IP's results
                         if let Ok(conn) = Connection::open(&dbp) {
                             for ip_str in &chunk {
+                                let in_batch = batch_results.contains_key(ip_str.as_str());
                                 let (rdns, org, asn_str, country, company_domain, asn_obj) =
                                     if let Some(resp) = batch_results.get(ip_str.as_str()) {
                                         let rdns = if resp.hostname.is_some() {
@@ -1466,13 +1467,17 @@ async fn run_lookups_and_display(
                                         rec.infra = infra.clone();
                                         rec.country = country.clone();
                                         rec.company_domain = company_domain.clone();
-                                        rec.looked_up = true;
+                                        rec.looked_up = in_batch;
                                         rec.lookup_in_progress = false;
                                     }
                                 }
 
                                 // Update DB
-                                update_ip_lookup(&conn, ip_str, rdns.as_deref(), org.as_deref(), asn_str.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                                if in_batch {
+                                    update_ip_lookup(&conn, ip_str, rdns.as_deref(), org.as_deref(), asn_str.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                                } else {
+                                    update_ip_partial(&conn, ip_str, rdns.as_deref(), infra.as_deref()).ok();
+                                }
                                 if let Some(ref asn_detail) = asn_obj {
                                     if let Some(ref asn_id) = asn_detail.asn {
                                         store_asn(&conn, asn_id, asn_detail.name.as_deref(), asn_detail.domain.as_deref(), asn_detail.route.as_deref(), asn_detail.asn_type.as_deref()).ok();
@@ -1501,7 +1506,7 @@ async fn run_lookups_and_display(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let (rdns, org, asn, infra, country, company_domain, asn_obj) =
+            let (rdns, org, asn, infra, country, company_domain, asn_obj, ipinfo_performed) =
                 perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref()), token.as_deref(), count, ipinfo_min_requests).await;
 
             {
@@ -1513,13 +1518,17 @@ async fn run_lookups_and_display(
                     rec.infra = infra.clone();
                     rec.country = country.clone();
                     rec.company_domain = company_domain.clone();
-                    rec.looked_up = true;
+                    rec.looked_up = ipinfo_performed;
                     rec.lookup_in_progress = false;
                 }
             }
 
             if let Ok(conn) = Connection::open(&dbp) {
-                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                if ipinfo_performed {
+                    update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                } else {
+                    update_ip_partial(&conn, &ip, rdns.as_deref(), infra.as_deref()).ok();
+                }
                 if let Some(ref asn_detail) = asn_obj {
                     if let Some(ref asn_id) = asn_detail.asn {
                         store_asn(&conn, asn_id, asn_detail.name.as_deref(), asn_detail.domain.as_deref(), asn_detail.route.as_deref(), asn_detail.asn_type.as_deref()).ok();
@@ -1751,7 +1760,7 @@ fn reselect_records(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let (rdns, org, asn, infra, country, company_domain, asn_obj) =
+            let (rdns, org, asn, infra, country, company_domain, asn_obj, ipinfo_performed) =
                 perform_lookup_with_cloud(&ip, cache.as_ref().map(|c| c.as_ref()), token.as_deref(), count, ipinfo_min_requests).await;
 
             {
@@ -1763,13 +1772,17 @@ fn reselect_records(
                     rec.infra = infra.clone();
                     rec.country = country.clone();
                     rec.company_domain = company_domain.clone();
-                    rec.looked_up = true;
+                    rec.looked_up = ipinfo_performed;
                     rec.lookup_in_progress = false;
                 }
             }
 
             if let Ok(conn) = Connection::open(&dbp) {
-                update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                if ipinfo_performed {
+                    update_ip_lookup(&conn, &ip, rdns.as_deref(), org.as_deref(), asn.as_deref(), infra.as_deref(), country.as_deref(), company_domain.as_deref()).ok();
+                } else {
+                    update_ip_partial(&conn, &ip, rdns.as_deref(), infra.as_deref()).ok();
+                }
                 if let Some(ref asn_detail) = asn_obj {
                     if let Some(ref asn_id) = asn_detail.asn {
                         store_asn(&conn, asn_id, asn_detail.name.as_deref(), asn_detail.domain.as_deref(), asn_detail.route.as_deref(), asn_detail.asn_type.as_deref()).ok();
@@ -2340,7 +2353,7 @@ fn render_ip_view(
         })
         .collect();
 
-    let mut widths = vec![Constraint::Length(10), Constraint::Length(6)];
+    let mut widths = vec![Constraint::Min(10), Constraint::Length(6)];
     if dc.has_bytes {
         widths.push(Constraint::Length(10));
         widths.push(Constraint::Length(6));
@@ -2492,7 +2505,7 @@ fn render_grouped_view<F, E>(
         .collect();
 
     let mut widths = vec![
-        Constraint::Length(10),
+        Constraint::Min(10),
         Constraint::Length(6),
         Constraint::Length(6),
     ];
@@ -2598,7 +2611,7 @@ fn render_ua_global_view(
         })
         .collect();
 
-    let mut widths = vec![Constraint::Length(10), Constraint::Length(6)];
+    let mut widths = vec![Constraint::Min(10), Constraint::Length(6)];
     if dc.has_bytes {
         widths.push(Constraint::Length(10));
         widths.push(Constraint::Length(6));
@@ -3083,7 +3096,7 @@ async fn perform_lookup_with_cloud(
     ipinfo_token: Option<&str>,
     request_count: u64,
     ipinfo_min_requests: u64,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<IpInfoAsn>) {
+) -> (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<IpInfoAsn>, bool) {
     // Check cloud cache → result goes to infra (not org)
     let infra = if let Some(cache) = cloud_cache {
         if let Ok(addr) = ip.parse::<IpAddr>() {
@@ -3139,7 +3152,7 @@ async fn perform_lookup_with_cloud(
                         (None, None)
                     };
 
-                    return (rdns, org, asn_str, infra, country, company_domain, asn_obj);
+                    return (rdns, org, asn_str, infra, country, company_domain, asn_obj, true);
                 }
                 Err(e) => {
                     eprintln!("ERROR: ipinfo lookup failed for {}: {:#}", ip, e);
@@ -3159,7 +3172,7 @@ async fn perform_lookup_with_cloud(
         .await
         .ok()
         .flatten();
-        (rdns, None, None, infra, None, None, None)
+        (rdns, None, None, infra, None, None, None, false)
     } else {
         // No ipinfo token: dns_lookup + cloud/whois
         let ip_clone = ip.to_string();
@@ -3176,7 +3189,7 @@ async fn perform_lookup_with_cloud(
 
         if infra.is_some() {
             // Cloud matched: skip whois
-            (rdns, None, None, infra, None, None, None)
+            (rdns, None, None, infra, None, None, None, true)
         } else {
             // No cloud match: run whois for org only
             let org = tokio::process::Command::new("whois")
@@ -3188,7 +3201,7 @@ async fn perform_lookup_with_cloud(
                     let text = String::from_utf8_lossy(&out.stdout);
                     extract_org_from_whois(&text)
                 });
-            (rdns, org, None, infra, None, None, None)
+            (rdns, org, None, infra, None, None, None, true)
         }
     }
 }
@@ -3242,6 +3255,13 @@ fn init_db(conn: &Connection) -> Result<()> {
     conn.execute("ALTER TABLE ips ADD COLUMN infra TEXT", []).ok();
     conn.execute("ALTER TABLE ips ADD COLUMN country TEXT", []).ok();
     conn.execute("ALTER TABLE ips ADD COLUMN company_domain TEXT", []).ok();
+
+    // Migrate: reset looked_up for IPs that were incorrectly marked as fully looked up
+    // but never got ipinfo data (no org, asn, country, or company_domain)
+    conn.execute(
+        "UPDATE ips SET looked_up = 0 WHERE looked_up = 1 AND org IS NULL AND asn IS NULL AND country IS NULL AND company_domain IS NULL",
+        [],
+    ).ok();
 
     // ASN details table
     conn.execute(
@@ -3419,6 +3439,19 @@ fn update_ip_lookup(
     conn.execute(
         "UPDATE ips SET looked_up = 1, reverse_dns = ?, org = ?, asn = ?, infra = ?, country = ?, company_domain = ? WHERE ip = ?",
         params![rdns, org, asn, infra, country, company_domain, ip],
+    )?;
+    Ok(())
+}
+
+fn update_ip_partial(
+    conn: &Connection,
+    ip: &str,
+    rdns: Option<&str>,
+    infra: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE ips SET reverse_dns = ?, infra = ? WHERE ip = ?",
+        params![rdns, infra, ip],
     )?;
     Ok(())
 }
