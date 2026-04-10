@@ -57,6 +57,7 @@ enum GroupBy {
     Org,
     Asn,
     UserAgent,
+    CloudProvider,
 }
 
 impl GroupBy {
@@ -65,7 +66,8 @@ impl GroupBy {
             GroupBy::Ip => GroupBy::Org,
             GroupBy::Org => GroupBy::Asn,
             GroupBy::Asn => GroupBy::UserAgent,
-            GroupBy::UserAgent => GroupBy::Ip,
+            GroupBy::UserAgent => GroupBy::CloudProvider,
+            GroupBy::CloudProvider => GroupBy::Ip,
         }
     }
 
@@ -75,6 +77,7 @@ impl GroupBy {
             GroupBy::Org => "Org",
             GroupBy::Asn => "ASN",
             GroupBy::UserAgent => "UA",
+            GroupBy::CloudProvider => "Cloud",
         }
     }
 }
@@ -143,6 +146,127 @@ fn effective_org(org: &str, cloud_detail: bool) -> String {
     } else {
         org.to_string()
     }
+}
+
+fn classify_cloud_provider(rec: &IpRecord) -> String {
+    // Priority 1: infra field (IP-range-based, authoritative)
+    if let Some(ref infra) = rec.infra {
+        if let Some(prefix) = cloud_provider_prefix(infra) {
+            return prefix.to_string();
+        }
+        return infra.clone();
+    }
+
+    // Priority 2: name-based matching on org, company_domain, asn
+    let fields: [Option<&str>; 3] = [
+        rec.org.as_deref(),
+        rec.company_domain.as_deref(),
+        rec.asn.as_deref(),
+    ];
+
+    for field in fields.iter().filter_map(|f| *f) {
+        let lower = field.to_lowercase();
+
+        if lower.contains("amazon") || lower.contains("aws") {
+            return "AWS".to_string();
+        }
+        if lower.contains("microsoft") || lower.contains("azure") {
+            return "Azure".to_string();
+        }
+        if lower.contains("google") || lower.contains("gcp") {
+            return "GCP".to_string();
+        }
+        if lower.contains("digitalocean") {
+            return "DigitalOcean".to_string();
+        }
+        if lower.contains("cloudflare") {
+            return "Cloudflare".to_string();
+        }
+        if lower.contains("ovh") {
+            return "OVH".to_string();
+        }
+        if lower.contains("hetzner") {
+            return "Hetzner".to_string();
+        }
+        if lower.contains("linode") || lower.contains("akamai") {
+            return "Linode/Akamai".to_string();
+        }
+        if lower.contains("vultr") || lower.contains("choopa") {
+            return "Vultr".to_string();
+        }
+        if (lower.contains("oracle") && lower.contains("cloud")) || lower.contains("oraclecloud") {
+            return "Oracle Cloud".to_string();
+        }
+        if lower.contains("alibaba") || lower.contains("aliyun") || lower.contains("alicloud") {
+            return "Alibaba Cloud".to_string();
+        }
+        if lower.contains("tencent") {
+            return "Tencent Cloud".to_string();
+        }
+        if lower.contains("scaleway") || lower.contains("online.net") || lower.contains("iliad") {
+            return "Scaleway".to_string();
+        }
+        if lower.contains("upcloud") {
+            return "UpCloud".to_string();
+        }
+        if lower.contains("hostinger") {
+            return "Hostinger".to_string();
+        }
+        if lower.contains("orange") {
+            return "Orange".to_string();
+        }
+        if lower.contains("contabo") {
+            return "Contabo".to_string();
+        }
+        if lower.contains("ionos") || lower.contains("1&1") || lower.contains("1and1") {
+            return "IONOS".to_string();
+        }
+        if lower.contains("leaseweb") {
+            return "LeaseWeb".to_string();
+        }
+        if lower.contains("rackspace") {
+            return "Rackspace".to_string();
+        }
+        if lower.contains("softlayer") || lower.contains("ibm cloud") {
+            return "IBM Cloud".to_string();
+        }
+        if lower.contains("kamatera") {
+            return "Kamatera".to_string();
+        }
+        if lower.contains("cherry") && lower.contains("server") {
+            return "Cherry Servers".to_string();
+        }
+        if lower.contains("netcup") {
+            return "Netcup".to_string();
+        }
+        if lower.contains("quadranet") {
+            return "QuadraNet".to_string();
+        }
+        if lower.contains("colocrossing") {
+            return "ColoCrossing".to_string();
+        }
+        if lower.contains("frantech") || lower.contains("buyvm") || lower.contains("ponynet") {
+            return "BuyVM/FranTech".to_string();
+        }
+        if lower.contains("psychz") {
+            return "Psychz".to_string();
+        }
+        if lower.contains("zenlayer") {
+            return "Zenlayer".to_string();
+        }
+        if lower.contains("serverius") {
+            return "Serverius".to_string();
+        }
+        if lower.contains("fastly") {
+            return "Fastly".to_string();
+        }
+        if lower.contains("heroku") || lower.contains("salesforce") {
+            return "Heroku/Salesforce".to_string();
+        }
+    }
+
+    // Priority 3: no match
+    "Other/Unknown".to_string()
 }
 
 struct ParsedLine {
@@ -1968,6 +2092,19 @@ async fn run_tui(
                     &search_str,
                     &dc,
                 ),
+                GroupBy::CloudProvider => render_grouped_view(
+                    f,
+                    &filtered_recs,
+                    &mut table_state,
+                    total_lines,
+                    pending,
+                    filter_desc,
+                    "Cloud Provider",
+                    &search_str,
+                    &dc,
+                    |r| classify_cloud_provider(r),
+                    None::<(&str, fn(&IpRecord) -> Option<String>)>,
+                ),
             }
 
             if show_help {
@@ -2074,6 +2211,10 @@ async fn run_tui(
                         })
                         .len(),
                         GroupBy::UserAgent => global_ua_counts.len(),
+                        GroupBy::CloudProvider => aggregate_by_field(&filtered_owned, &|r: &IpRecord| {
+                            classify_cloud_provider(r)
+                        })
+                        .len(),
                     };
 
                     match key.code {
@@ -2185,7 +2326,7 @@ fn render_help_overlay(f: &mut ratatui::Frame, dc: &DisplayConfig) {
         ("Home / End", "Jump to first / last row"),
         ("f / F3", "Search / filter"),
         ("s", "Toggle sort (hits / bandwidth)"),
-        ("g", "Cycle group by (IP / Org / ASN / UA)"),
+        ("g", "Cycle group by (IP / Org / ASN / UA / Cloud)"),
         ("r", "Toggle reverse DNS column"),
         ("u", "Toggle user agent column"),
         ("o", "Toggle org column"),
@@ -5128,7 +5269,8 @@ mod tests {
         assert_eq!(GroupBy::Ip.next(), GroupBy::Org);
         assert_eq!(GroupBy::Org.next(), GroupBy::Asn);
         assert_eq!(GroupBy::Asn.next(), GroupBy::UserAgent);
-        assert_eq!(GroupBy::UserAgent.next(), GroupBy::Ip);
+        assert_eq!(GroupBy::UserAgent.next(), GroupBy::CloudProvider);
+        assert_eq!(GroupBy::CloudProvider.next(), GroupBy::Ip);
     }
 
     #[test]
@@ -5137,6 +5279,85 @@ mod tests {
         assert_eq!(GroupBy::Org.label(), "Org");
         assert_eq!(GroupBy::Asn.label(), "ASN");
         assert_eq!(GroupBy::UserAgent.label(), "UA");
+        assert_eq!(GroupBy::CloudProvider.label(), "Cloud");
+    }
+
+    // ===== Cloud Provider Classification Tests =====
+
+    fn make_rec(org: Option<&str>, infra: Option<&str>, asn: Option<&str>, company_domain: Option<&str>) -> IpRecord {
+        IpRecord {
+            ip: "1.2.3.4".to_string(),
+            count: 1,
+            bytes: 0,
+            looked_up: true,
+            lookup_in_progress: false,
+            in_display_set: true,
+            org: org.map(|s| s.to_string()),
+            infra: infra.map(|s| s.to_string()),
+            asn: asn.map(|s| s.to_string()),
+            company_domain: company_domain.map(|s| s.to_string()),
+            reverse_dns: None,
+            user_agent: None,
+            country: None,
+        }
+    }
+
+    #[test]
+    fn test_classify_cloud_infra_takes_priority() {
+        let rec = make_rec(Some("Hetzner Online GmbH"), Some("AWS / EC2 / us-east-1"), None, None);
+        assert_eq!(classify_cloud_provider(&rec), "AWS");
+    }
+
+    #[test]
+    fn test_classify_cloud_org_fallback() {
+        assert_eq!(classify_cloud_provider(&make_rec(Some("OVH SAS"), None, None, None)), "OVH");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Hetzner Online GmbH"), None, None, None)), "Hetzner");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("AMAZON-02"), None, None, None)), "AWS");
+    }
+
+    #[test]
+    fn test_classify_cloud_domain_match() {
+        let rec = make_rec(None, None, None, Some("hetzner.com"));
+        assert_eq!(classify_cloud_provider(&rec), "Hetzner");
+    }
+
+    #[test]
+    fn test_classify_cloud_asn_match() {
+        let rec = make_rec(None, None, Some("AS16276 OVH SAS"), None);
+        assert_eq!(classify_cloud_provider(&rec), "OVH");
+    }
+
+    #[test]
+    fn test_classify_cloud_unknown() {
+        let rec = make_rec(Some("Comcast Cable"), None, None, None);
+        assert_eq!(classify_cloud_provider(&rec), "Other/Unknown");
+    }
+
+    #[test]
+    fn test_classify_cloud_no_data() {
+        let rec = make_rec(None, None, None, None);
+        assert_eq!(classify_cloud_provider(&rec), "Other/Unknown");
+    }
+
+    #[test]
+    fn test_classify_cloud_extended_providers() {
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Linode LLC"), None, None, None)), "Linode/Akamai");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Choopa LLC"), None, None, None)), "Vultr");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Alibaba Cloud"), None, None, None)), "Alibaba Cloud");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Tencent Cloud"), None, None, None)), "Tencent Cloud");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Scaleway S.A.S."), None, None, None)), "Scaleway");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("UpCloud Ltd"), None, None, None)), "UpCloud");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Hostinger International"), None, None, None)), "Hostinger");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Orange S.A."), None, None, None)), "Orange");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Contabo GmbH"), None, None, None)), "Contabo");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("IONOS SE"), None, None, None)), "IONOS");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("1&1 Internet AG"), None, None, None)), "IONOS");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("LeaseWeb"), None, None, None)), "LeaseWeb");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Rackspace Ltd"), None, None, None)), "Rackspace");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("SoftLayer Technologies"), None, None, None)), "IBM Cloud");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Netcup GmbH"), None, None, None)), "Netcup");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("FranTech Solutions"), None, None, None)), "BuyVM/FranTech");
+        assert_eq!(classify_cloud_provider(&make_rec(Some("Fastly Inc"), None, None, None)), "Fastly");
     }
 
     // ===== IpInfo Structured Response Tests =====
